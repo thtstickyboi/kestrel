@@ -58,7 +58,7 @@ open an issue when it breaks, because it will.
 | **Rust** | 1.80 or newer, from [rustup.rs](https://rustup.rs) |
 | **GPU** | Anything with a working Vulkan, DX12 or Metal driver |
 | **VRAM** | Depends on the soundfont and `--max-voices`; see below. Tuned against 8 GB |
-| **OS** | Windows, Linux, macOS -- though only Windows has actually been run. See below |
+| **OS** | Windows, Linux, macOS. Only Windows has been *run*; see below |
 
 There are no system libraries to install and nothing to download separately.
 Every dependency comes from crates.io, and the shaders are compiled into the
@@ -72,7 +72,14 @@ driver, not by cargo, so Intel's shader compiler is an entirely separate path
 from NVIDIA's, and the two producing the same audio is real evidence the
 shaders are portable.
 
-AMD, Apple silicon and Linux are still unverified. If you are first on one of
+Linux and macOS **compile** clean -- `cargo check --all-targets` passes for
+`x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`, which type-checks wgpu's
+Vulkan and Metal backends along with everything else. Neither has been linked
+or run, so that is one step short of a guarantee. There is no platform-specific
+code in the crate and no C dependencies, which is the reason to expect it to
+work rather than a promise that it does.
+
+AMD, Apple silicon and Linux are still unrun. If you are first on one of
 those, please open an issue either way; a report that it simply worked is as
 useful as a crash.
 
