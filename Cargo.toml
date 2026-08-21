@@ -7,7 +7,7 @@ authors = ["thtstickyboi"]
 description = "GPU-accelerated SoundFont/SFZ synthesizer for black MIDI"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/thtstickyboi/kestrel"
+repository = "https://github.com/thtstickyboi/kestrel-midi"
 keywords = ["midi", "synthesizer", "soundfont", "gpu", "wgpu"]
 categories = ["multimedia::audio", "command-line-utilities", "rendering"]
 # Generated test material and the BASSMIDI SDK live in the working tree but are

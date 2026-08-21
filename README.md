@@ -126,11 +126,11 @@ smaller card, and lower `--max-voices` with it.
 ## Building
 
 ```bash
-git clone https://github.com/thtstickyboi/kestrel.git
+git clone https://github.com/thtstickyboi/kestrel-midi.git
 ```
 
 ```bash
-cd kestrel && cargo build --release
+cd kestrel-midi && cargo build --release
 ```
 
 Build it in **release mode**. The debug build is not merely slower, it is
