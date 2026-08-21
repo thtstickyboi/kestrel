@@ -335,6 +335,16 @@ each voice compares its own ordinal against it.
   nothing. Run `kestrel info` on a MIDI first: it lists every controller the
   file uses, marks the unimplemented ones `MISSING`, and tells you what
   percentage of the file's controller events fall in that bucket.
+- **Notes can keep sounding after the music stops, on some soundfonts.**
+  Reported on a 44.7M-note file: from roughly two thirds of the way in, notes
+  sound in a region with no note-ons behind them. It reproduces at every pool
+  size tried and on one soundfont but not another, which is the clue --
+  suspicion is that note-offs arriving while the sustain pedal (CC64) is down
+  are deferred and never released if the pedal does not come back up. Those
+  voices then sound until their sample runs out, so a library with long
+  reverb-tail samples makes it obvious while a drier one hides it. Not yet
+  root-caused; if you hear it, `--limiter off` and a shorter-sampled soundfont
+  will tell you quickly whether you are looking at the same thing.
 - **No realtime playback.** Offline rendering to WAV only.
 - **No host integration.** There is no C ABI and no plugin build, so nothing
   else can currently drive this as a backend.
