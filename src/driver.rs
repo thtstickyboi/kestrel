@@ -13,6 +13,13 @@ use crate::midi::{Event, MidiStream, TempoClock};
 use crate::fixed::bend_factor;
 use crate::voice::{ChannelTable, GateTable, SpawnCmd};
 use anyhow::{bail, Result};
+
+/// Time strata a saturated block is cut into before ranking admission.
+///
+/// Bounds how far the admitted set can drift in time while leaving each
+/// stratum wide enough that ranking inside it is a real choice. At 64 a
+/// 4096-frame block is cut into 64-frame pieces, 1.3 ms apiece.
+const ADMIT_STRATA: usize = 64;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -431,30 +438,75 @@ impl Driver {
         // the survivors sound.
         if self.cfg.admit_rule == AdmitRule::Loudest && !self.spawn_buf.is_empty() {
             let live = backend.stats().active_voices as u32;
-            let queued = self.spawn_buf.len();
-            let take = self.cfg.admit_take(live, queued as u32) as usize;
+            let want = self.spawn_buf.len();
+            let take = self.cfg.admit_take(live, want as u32) as usize;
             // A block that fits needs no ranking at all: nothing is dropped,
             // so the order it goes in is the order it came in.
-            if take < queued {
+            if take < want && take > 0 {
                 let gates = &self.gates;
-                let key = |c: &SpawnCmd| {
-                    std::cmp::Reverse(crate::voice::admit_key(
-                        c,
-                        !gates.released(c.gate_slot, c.ordinal),
-                    ))
-                };
-                // Partition first, then sort only the part that survives.
-                // Sorting the whole block is O(n log n) over every note-on in
-                // it; a saturated block queues several times what it can
-                // admit, so this is the difference between sorting 58k and
-                // sorting 8k. The prefix is still fully sorted afterwards
-                // because `select_nth_unstable` leaves it in an unspecified
-                // order, and an unspecified order would decide which voice
-                // lands in which pool slot -- and therefore the summation
-                // order of the mixdown, and therefore the last bit of the
-                // output.
-                self.spawn_buf.select_nth_unstable_by_key(take, key);
-                self.spawn_buf[..take].sort_unstable_by_key(key);
+                // Rank *within* `spawn_pick`'s time slices, not across the
+                // whole block.
+                //
+                // Ranking globally was the first attempt and it reintroduced
+                // exactly the artifact `spawn_pick` exists to prevent. The top
+                // `take` by amplitude has no reason to be spread across the
+                // block, and loud notes cluster in time -- chords, downbeats --
+                // so the admitted set piled up at the block's opening and left
+                // its tail thin. Measured on The Nuker 3, which drops 48% of
+                // its voices, that was +6.3 dB at the start of the block
+                // against the block mean, audible as pumping at the block rate.
+                //
+                // The slices decide *when*, exactly as before; the key decides
+                // *which note within each slice*. Both properties at once
+                // rather than one traded for the other.
+                //
+                // Slice `i` is `[i*want/take, (i+1)*want/take)`, which is
+                // `spawn_pick`'s mapping read as a range. `take <= want` makes
+                // every slice non-empty, and slice starts are `>= i`, so
+                // swapping each winner down to position `i` never disturbs a
+                // slice not yet visited.
+                // How many strata to cut the block into. One winner per
+                // output slot was the first attempt and it over-constrained
+                // the choice: at 32k voices a slice held ~7 candidates, so
+                // ranking could only pick best-of-7 and recovered barely a
+                // fifth of the quality that global ranking bought. Wider
+                // strata with a proportional quota each restore the
+                // selectivity while still bounding how far the admitted set
+                // can drift in time. At 64 strata a 4096-frame block is cut
+                // into 64-frame pieces -- 1.3 ms, far too short to hear as
+                // clustering -- and each picks its own top share.
+                let strata = take.min(ADMIT_STRATA);
+                for s in 0..strata {
+                    let lo = (s as u64 * want as u64 / strata as u64) as usize;
+                    let hi = ((s + 1) as u64 * want as u64 / strata as u64) as usize;
+                    let olo = (s as u64 * take as u64 / strata as u64) as usize;
+                    let ohi = ((s + 1) as u64 * take as u64 / strata as u64) as usize;
+                    let q = ohi - olo;
+                    if q == 0 {
+                        continue;
+                    }
+                    let key = |c: &SpawnCmd| {
+                        std::cmp::Reverse(crate::voice::admit_key(
+                            c,
+                            !gates.released(c.gate_slot, c.ordinal),
+                        ))
+                    };
+                    let seg = &mut self.spawn_buf[lo..hi];
+                    let n = seg.len();
+                    if q < n {
+                        seg.select_nth_unstable_by_key(q, key);
+                    }
+                    // Sorted, not left in partition order: the order decides
+                    // which voice lands in which pool slot, and therefore the
+                    // summation order of the mixdown.
+                    seg[..q.min(n)].sort_unstable_by_key(key);
+                    // Slide the winners down. `olo <= lo` because
+                    // `take <= want`, so this never reaches into a stratum
+                    // still to be visited.
+                    for j in 0..q {
+                        self.spawn_buf.swap(olo + j, lo + j);
+                    }
+                }
             }
         }
         backend.spawn(&self.spawn_buf)?;

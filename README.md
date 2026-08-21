@@ -246,9 +246,17 @@ saturated file that is the bigger number by an order of magnitude -- on a
 against 5.7M voices stolen. Whatever rule governs admission is deciding most of
 what you hear.
 
-**`loudest`** (default) ranks each oversubscribed block and keeps the top of
-it. The rank is a 64-bit key: whether the note is still sounding at the end of
-the block, then its opening amplitude, then its note id as a tiebreak. The
+**`loudest`** (default) cuts an oversubscribed block into 64 time strata and
+ranks *within* each one, so every stratum keeps its own share. Ranking the
+block as a whole does not work: the loudest notes have no reason to be spread
+evenly in time, they cluster on chords and downbeats, and the admitted set then
+piles up at the block's opening and thins toward its end -- audible as pumping
+at the block rate on material dropping around half its voices. A stratum is
+1.3 ms, far too short to cluster audibly, and wide enough that ranking inside
+it is still a real choice.
+
+The rank itself is a 64-bit key: whether the note is still sounding at the end
+of the block, then its opening amplitude, then its note id as a tiebreak. The
 amplitude term is the voice's real opening gain -- it already carries the
 velocity, the region's own attenuation and its pan -- rather than a raw
 velocity byte. The id makes the key a total order with no ties, so the admitted
