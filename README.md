@@ -292,9 +292,33 @@ each voice compares its own ordinal against it.
   controllers do not have this problem; these two were left on the older
   timing deliberately, because the consequence is bounded and the fix changes
   timing elsewhere.
-- **SFZ support is partial.** The common opcodes work, including `#include`,
-  velocity layers and `fil_veltrack`. Exotic ones do not.
+- **SFZ `lorand`/`hirand` are ignored, so random region selection does not
+  work.** *(Very likely fixed in the next release -- see below.)* A soundfont
+  that uses random slices to choose between alternative regions gets **all of
+  them at once** rather than one. Ten slices per velocity layer is a common
+  arrangement, and that is then ten times the intended voice count on every
+  note. Worse, when the alternatives differ only by a small sample offset --
+  the usual trick for keeping repeated notes from phase-locking -- summing them
+  comb-filters the tone rather than merely making it louder. Kestrel warns when
+  it sees these opcodes, so you will not hit this silently. Until it is fixed,
+  use a preset that does not use `lorand` (most packs ship one), or cap
+  `--layers`.
+- **SFZ support is otherwise partial.** The common opcodes work, including
+  `#include`, velocity layers and `fil_veltrack`. Per-voice LFOs (`amplfo_*`,
+  `fillfo_*`, `pitchlfo_*`) are recognised and reported, not applied -- though
+  note that an LFO with a rate and no `*_depth` opcode would do nothing anyway,
+  which is the common case in piano libraries.
 - **NaN checking is off in release builds** unless you pass `--nan-guard`.
+
+## Planned for the next release
+
+**`lorand`/`hirand` support** is the priority, and it is expected to land in
+0.2.0. It is one of the cheaper missing opcodes to add and it does not threaten
+the determinism guarantee: the roll becomes a hash of the note id, so it varies
+from note to note while two renders of the same file stay byte-identical.
+
+Nothing else is committed. Effects, a host C ABI and realtime playback remain
+out of scope for now.
 
 ## License
 
