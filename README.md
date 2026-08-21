@@ -363,8 +363,8 @@ each voice compares its own ordinal against it.
 
 ## Planned for the next release
 
-**`lorand`/`hirand` support** is the priority, and it is expected to land in
-0.2.0. It is one of the cheaper missing opcodes to add and it does not threaten
+**`lorand`/`hirand` support** is the priority and is the next thing being
+worked on. It is one of the cheaper missing opcodes to add and it does not threaten
 the determinism guarantee: the roll becomes a hash of the note id, so it varies
 from note to note while two renders of the same file stay byte-identical.
 
