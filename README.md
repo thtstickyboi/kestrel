@@ -1,5 +1,7 @@
 # Kestrel
 
+'*experimental*'
+
 A GPU-accelerated SoundFont/SFZ synthesizer for black MIDI.
 
 Kestrel renders a MIDI file to a WAV offline, doing the synthesis in compute
