@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use kestrel::backend::Backend;
 use kestrel::limiter::LimiterMode;
 use kestrel::config::{
-    BackendKind, Config, EnvelopeCurve, Interpolation, StealRule,
+    AdmitRule, BackendKind, Config, EnvelopeCurve, Interpolation, StealRule,
 };
 use kestrel::{cpu::CpuSynth, driver::Driver, gpu, load_bank, testkit, wav};
 use std::path::PathBuf;
@@ -92,6 +92,11 @@ struct RenderArgs {
     release_curve: String,
     #[arg(long, default_value = "quietest")]
     steal: String,
+    /// Which note-ons survive when one block has more of them than the pool
+    /// has room for: loudest ranks by whether the note outlives the block and
+    /// then by opening amplitude; even thins by position, ignoring both.
+    #[arg(long = "admit", default_value = "loudest")]
+    admit: String,
     /// Ceiling on how much of the voice pool one block may steal, in percent.
     /// 100 lets a saturated block replace the entire pool, which pumps.
     #[arg(long = "steal-percent", default_value_t = 25)]
@@ -203,6 +208,8 @@ impl RenderArgs {
         }
         cfg.steal_rule = StealRule::parse(&self.steal)
             .with_context(|| format!("unknown steal rule {:?}", self.steal))?;
+        cfg.admit_rule = AdmitRule::parse(&self.admit)
+            .with_context(|| format!("unknown admit rule {:?}", self.admit))?;
         cfg.validate()?;
         let kind = if self.backend == "cpu" {
             BackendKind::Cpu

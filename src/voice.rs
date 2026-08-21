@@ -74,6 +74,42 @@ pub fn spawn_pick(i: usize, want: usize, take: usize) -> usize {
     (i as u64 * want as u64 / take as u64) as usize
 }
 
+/// The 64-bit key admission ranks queued spawns by, highest kept first.
+///
+/// `spawn_pick` thins a saturated block evenly, which fixes the rhythmic
+/// artifact a prefix causes but is blind to what it is dropping: a fortissimo
+/// whole note and a 10 ms grace note have identical odds. On a file that
+/// oversubscribes the pool fifteen to one that is most of what you hear, and
+/// what you hear is the loud sustained material being punched out at random.
+///
+/// The key is three fields, most significant first:
+///
+/// * **sustained** -- 1 if the note is still sounding at the end of this
+///   block, 0 if its note-off already arrived inside it. A note that has
+///   already ended is the cheapest thing in the block to give up, because
+///   nothing is lost past the block boundary.
+/// * **loudness** -- `gain_l + gain_r` quantised to 15 bits. These gains
+///   already carry the velocity, the region's own attenuation and its pan, so
+///   this is the voice's actual opening amplitude rather than a raw velocity
+///   byte.
+/// * **note id** -- the low 48 bits, as a tiebreak.
+///
+/// The id makes it a total order with no ties, so the admitted set is a pure
+/// function of the input and never of scheduling order. Both backends call
+/// this. Two backends admitting different notes would not show up as an error,
+/// only as two renders that quietly disagree.
+///
+/// Reordering the queue is safe because a voice's position in time is carried
+/// by `start_rel`, not by its index: thinning by rank still leaves every
+/// admitted note sounding at exactly the frame it should.
+#[inline]
+pub fn admit_key(cmd: &SpawnCmd, sustained: bool) -> u64 {
+    let gain = (cmd.gain_l.abs() + cmd.gain_r.abs()).clamp(0.0, 1.0);
+    let q = (gain * 32767.0) as u32 as u64;
+    let id = ((cmd.note_id_hi as u64) << 32) | cmd.note_id_lo as u64;
+    ((sustained as u64) << 63) | (q << 48) | (id & 0x0000_FFFF_FFFF_FFFF)
+}
+
 /// Per-block note-off state, sampled once per reduce tile.
 ///
 /// A voice cannot be found by searching the pool without either a sort or an
@@ -141,6 +177,14 @@ impl GateTable {
             self.rows[base..base + GATE_SLOTS].copy_from_slice(&self.off_count);
             self.cursor += 1;
         }
+    }
+
+    /// Whether the note-off for `ordinal` at `slot` has already been
+    /// published. Used by admission to tell a note that outlives the block
+    /// from one that is over before the block ends.
+    #[inline]
+    pub fn released(&self, slot: u32, ordinal: u32) -> bool {
+        self.off_count[slot as usize % GATE_SLOTS] >= ordinal
     }
 
     /// Register a note-on. Returns the ordinal the voice should carry.

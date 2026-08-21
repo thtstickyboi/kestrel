@@ -84,6 +84,57 @@ pub enum StealRule {
     Quietest = 2,
 }
 
+/// Which of a saturated block's note-ons get admitted when they outnumber the
+/// free pool slots.
+///
+/// Distinct from `StealRule`, which decides who *dies*. On a heavily
+/// oversubscribed file dropping dominates stealing by an order of magnitude,
+/// so this is the rule that decides most of what is heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum AdmitRule {
+    /// Rank by `voice::admit_key`: notes that outlive the block first, then by
+    /// opening amplitude, with the note id as a tiebreak. Keeps the loud
+    /// sustained material and spends the budget on notes that are audible.
+    Loudest = 0,
+    /// Thin the block evenly by event position, ignoring what each note is.
+    /// The behaviour before ranking existed; kept for comparing against it.
+    Even = 1,
+}
+
+impl Config {
+    /// How many of `queued` note-ons a block can admit, given `live` voices
+    /// already in the pool.
+    ///
+    /// Mirrors the arithmetic both backends do in their own `spawn`. The
+    /// driver needs the same number to know where to partition the ranked
+    /// block: partition short and the backend admits notes that were never
+    /// ranked, partition long and the work is wasted. Kept here so the three
+    /// call sites cannot drift apart.
+    pub fn admit_take(&self, live: u32, queued: u32) -> u32 {
+        let cap = self.max_voices;
+        let want = queued.min(cap);
+        if live + want <= cap {
+            return want;
+        }
+        let need = match self.steal_rule {
+            StealRule::DropNew => 0,
+            _ => (live + want - cap).min(live).min(self.max_steal()),
+        };
+        want.min(cap - (live - need))
+    }
+}
+
+impl AdmitRule {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "loudest" | "loud" | "rank" | "ranked" => Some(AdmitRule::Loudest),
+            "even" | "spread" | "flat" => Some(AdmitRule::Even),
+            _ => None,
+        }
+    }
+}
+
 impl StealRule {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
@@ -140,6 +191,8 @@ pub struct Config {
     /// each; this caps runaway presets.
     pub max_layers: u32,
     pub steal_rule: StealRule,
+    /// Which note-ons survive when a block oversubscribes the pool.
+    pub admit_rule: AdmitRule,
     /// Ceiling on how much of the pool one block may steal, in percent.
     ///
     /// Without this, a block whose note-ons outnumber the pool steals *every*
@@ -300,6 +353,7 @@ impl Default for Config {
             max_voices: 1 << 20,
             max_layers: 16,
             steal_rule: StealRule::Quietest,
+            admit_rule: AdmitRule::Loudest,
             max_steal_percent: 25,
             steal_fade_frames: 96,
             sort_voices: true,

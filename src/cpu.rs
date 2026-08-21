@@ -12,7 +12,7 @@
 
 use crate::backend::{Backend, BlockStats};
 use crate::bank::{Bank, RegionParams, RP_FILTER, VF_LOOP, VF_LOOP_UNTIL_RELEASE};
-use crate::config::{Config, EnvelopeCurve, Interpolation, StealRule};
+use crate::config::{AdmitRule, Config, EnvelopeCurve, Interpolation, StealRule};
 use crate::fixed::{Fixed, FRAC_SCALE_F32};
 use crate::voice::*;
 use anyhow::Result;
@@ -193,6 +193,18 @@ impl CpuSynth {
         (v as f32 * (1.0 / 32767.0)).max(-1.0)
     }
 
+    /// Which queued spawn the `i`-th accepted one is. The driver has already
+    /// sorted the block by `admit_key` under `AdmitRule::Loudest`, so a prefix
+    /// is exactly the highest-ranked `take`; under `Even` the old positional
+    /// thinning still applies.
+    #[inline(always)]
+    fn pick(&self, i: usize, want: usize, take: usize) -> usize {
+        match self.cfg.admit_rule {
+            AdmitRule::Loudest => i,
+            AdmitRule::Even => spawn_pick(i, want, take),
+        }
+    }
+
     /// The 64-bit key voice stealing selects the k smallest of. Mirrors
     /// `steal_key` in `shaders/common.wgsl` bit for bit; the two backends
     /// choosing different victims would not show up as an error, only as two
@@ -326,7 +338,7 @@ impl Backend for CpuSynth {
                     let take = want.min(cap.saturating_sub(live));
                     self.dropped += (want - take) as u64;
                     for i in 0..take {
-                        self.pool.push(&cmds[spawn_pick(i, want, take)]);
+                        self.pool.push(&cmds[self.pick(i, want, take)]);
                     }
                     return Ok(());
                 }
@@ -364,7 +376,7 @@ impl Backend for CpuSynth {
                     let take = want.min(cap - (live - need));
                     self.dropped += (want - take) as u64;
                     for i in 0..take {
-                        self.pool.push(&cmds[spawn_pick(i, want, take)]);
+                        self.pool.push(&cmds[self.pick(i, want, take)]);
                     }
                     return Ok(());
                 }

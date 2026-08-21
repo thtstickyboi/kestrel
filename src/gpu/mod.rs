@@ -18,7 +18,7 @@ pub use device::print_adapters;
 
 use crate::backend::{Backend, BlockStats};
 use crate::bank::{Bank, RegionParams};
-use crate::config::{Config, EnvelopeCurve, StealRule};
+use crate::config::{AdmitRule, Config, EnvelopeCurve, StealRule};
 use crate::voice::{spawn_pick, SpawnCmd, BEND_CHANNELS, CHAN_FIELDS, GATE_SLOTS};
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
@@ -1000,12 +1000,24 @@ impl Backend for GpuSynth {
                 self.queue
                     .write_buffer(&self.cmds_buf, 0, bytemuck::cast_slice(&self.pending_spawns));
             } else {
-                // Thinned across the block rather than truncated to a prefix,
-                // so a saturated block keeps its timing. See `spawn_pick`.
+                // Under `AdmitRule::Loudest` the driver has already sorted the
+                // block by rank, so a prefix is the highest-ranked `take`.
+                // Under `Even` it is thinned across the block instead of
+                // truncated, so a saturated block keeps its timing rather than
+                // being heard at its start and silent at its end. See
+                // `spawn_pick`.
                 self.spawn_scratch.clear();
                 self.spawn_scratch.reserve(take);
-                for i in 0..take {
-                    self.spawn_scratch.push(self.pending_spawns[spawn_pick(i, total, take)]);
+                match self.cfg.admit_rule {
+                    AdmitRule::Loudest => self
+                        .spawn_scratch
+                        .extend_from_slice(&self.pending_spawns[..take]),
+                    AdmitRule::Even => {
+                        for i in 0..take {
+                            self.spawn_scratch
+                                .push(self.pending_spawns[spawn_pick(i, total, take)]);
+                        }
+                    }
                 }
                 self.queue
                     .write_buffer(&self.cmds_buf, 0, bytemuck::cast_slice(&self.spawn_scratch));

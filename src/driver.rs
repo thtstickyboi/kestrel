@@ -7,7 +7,7 @@
 
 use crate::backend::Backend;
 use crate::bank::{Bank, ParamMod, VoiceSpawn};
-use crate::config::Config;
+use crate::config::{AdmitRule, Config};
 use crate::limiter::{clamp_block, Brickwall, Limiter, LimiterMode};
 use crate::midi::{Event, MidiStream, TempoClock};
 use crate::fixed::bend_factor;
@@ -423,6 +423,40 @@ impl Driver {
             // controller path stays on for it.
             self.chan.variant_active() || self.spawn_variants,
         )?;
+        // Rank the block before the backend thins it. Sorted here rather than
+        // in each backend so the two cannot disagree, and after the whole
+        // block's events are in so `released` sees every note-off that landed
+        // inside it. A voice's position in time rides on `start_rel`, so
+        // reordering the queue changes only which notes survive, never when
+        // the survivors sound.
+        if self.cfg.admit_rule == AdmitRule::Loudest && !self.spawn_buf.is_empty() {
+            let live = backend.stats().active_voices as u32;
+            let queued = self.spawn_buf.len();
+            let take = self.cfg.admit_take(live, queued as u32) as usize;
+            // A block that fits needs no ranking at all: nothing is dropped,
+            // so the order it goes in is the order it came in.
+            if take < queued {
+                let gates = &self.gates;
+                let key = |c: &SpawnCmd| {
+                    std::cmp::Reverse(crate::voice::admit_key(
+                        c,
+                        !gates.released(c.gate_slot, c.ordinal),
+                    ))
+                };
+                // Partition first, then sort only the part that survives.
+                // Sorting the whole block is O(n log n) over every note-on in
+                // it; a saturated block queues several times what it can
+                // admit, so this is the difference between sorting 58k and
+                // sorting 8k. The prefix is still fully sorted afterwards
+                // because `select_nth_unstable` leaves it in an unspecified
+                // order, and an unspecified order would decide which voice
+                // lands in which pool slot -- and therefore the summation
+                // order of the mixdown, and therefore the last bit of the
+                // output.
+                self.spawn_buf.select_nth_unstable_by_key(take, key);
+                self.spawn_buf[..take].sort_unstable_by_key(key);
+            }
+        }
         backend.spawn(&self.spawn_buf)?;
         self.stats.voices_spawned += self.spawn_buf.len() as u64;
         backend.render(out)?;

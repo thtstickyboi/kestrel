@@ -64,12 +64,23 @@ There are no system libraries to install and nothing to download separately.
 Every dependency comes from crates.io, and the shaders are compiled into the
 binary.
 
-**It has been run on exactly one machine: an RTX 5060 Laptop on Windows, via
-Vulkan.** Nothing here is Windows-specific and wgpu covers DX12, Metal and
-Vulkan equally, so other platforms should work -- but "should" is doing real
-work in that sentence. If you are the first to run this on AMD, Intel, Apple
-silicon, or Linux, please open an issue either way. A report that it simply
-worked is as useful as a crash.
+**Tested on NVIDIA and Intel, both on Windows via Vulkan.** The two agree:
+rendering the same file on an RTX 5060 and on an Intel iGPU nulls at
+**-111 dB peak, -127 dB RMS**, and each device is byte-identical with itself
+across runs. That is worth more than it sounds -- WGSL is compiled by your
+driver, not by cargo, so Intel's shader compiler is an entirely separate path
+from NVIDIA's, and the two producing the same audio is real evidence the
+shaders are portable.
+
+AMD, Apple silicon and Linux are still unverified. If you are first on one of
+those, please open an issue either way; a report that it simply worked is as
+useful as a crash.
+
+Integrated GPUs are slower but genuinely usable -- the Intel part held 2.95x
+realtime against the 5060's 32.5x on the same 100k-note file, which is about
+what shared DDR5 against dedicated VRAM predicts for a bandwidth-bound
+workload. Kestrel prefers a discrete GPU when both are present, so you will not
+land on the slow one by accident.
 
 Kestrel requests whatever limits your adapter reports rather than demanding a
 fixed set, and it checks the ones it can before allocating: if the render pass
@@ -161,6 +172,7 @@ kestrel render huge.mid -s piano.sfz -o out.wav --limiter brickwall --profile
 | `--profile` | off | Per-pass GPU timings, once per wall-clock second. |
 | `--limiter` | `brickwall` | `brickwall`, `omni` or `off`. See *Limiting*. |
 | `--steal` | `quietest` | `quietest`, `oldest` or `drop-new`. See *Voice stealing*. |
+| `--admit` | `loudest` | `loudest` or `even`. Which note-ons survive when a block oversubscribes the pool. See *Admission*. |
 | `--volume X` | `1.0` | Pre-limiter gain. |
 | `--rate N` | `48000` | Output sample rate. |
 | `--format` | `float32` | `float32` or `pcm16`. |
@@ -218,6 +230,45 @@ does better.
 
 **`off`** disables limiting. Your mix will clip. Combine with `--volume` if you
 want to handle headroom yourself.
+
+## Admission
+
+Stealing decides who dies. **Admission decides who never starts**, and on a
+saturated file that is the bigger number by an order of magnitude -- on a
+44.7M-note file against a 32,767-voice pool, 83.7M note-ons were dropped
+against 5.7M voices stolen. Whatever rule governs admission is deciding most of
+what you hear.
+
+**`loudest`** (default) ranks each oversubscribed block and keeps the top of
+it. The rank is a 64-bit key: whether the note is still sounding at the end of
+the block, then its opening amplitude, then its note id as a tiebreak. The
+amplitude term is the voice's real opening gain -- it already carries the
+velocity, the region's own attenuation and its pan -- rather than a raw
+velocity byte. The id makes the key a total order with no ties, so the admitted
+set is a pure function of the input.
+
+**`even`** thins the block by position in time and ignores what each note is,
+which is what the renderer did before ranking existed. It is blind in a
+specific way: a fortissimo whole note and a 10 ms grace note have identical
+odds of survival.
+
+Measured on the same file and pool, `loudest` against `even`:
+
+| | `even` | `loudest` |
+|---|---|---|
+| RMS | -11.225 dB | **-10.065 dB** |
+| crest factor | 11.225 dB | **10.065 dB** |
+| samples above 0.01 | 88.7% | **93.7%** |
+
+A higher RMS at an identical peak, with a lower crest factor, is what "the long
+loud notes survived" looks like as a number. Ranking costs about 5% of render
+time.
+
+One limit worth knowing: "still sounding at the end of the block" is resolved
+at block granularity, not by true duration. A note that ends 5 ms into the next
+block counts as sustained. It works because genuinely short notes almost always
+end inside their own block, but it is an approximation rather than a
+measurement.
 
 ## Voice stealing
 
