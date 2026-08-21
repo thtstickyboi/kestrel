@@ -144,6 +144,9 @@ A more realistic invocation for a large file:
 ```bash
 kestrel render huge.mid -s piano.sfz -o out.wav --max-voices 2000000 --profile
 ```
+```bash
+kestrel render huge.mid -s piano.sfz -o out.wav --limiter brickwall --profile
+```
 
 ### The flags that actually matter
 
