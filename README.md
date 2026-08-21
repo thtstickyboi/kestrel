@@ -146,7 +146,7 @@ the fallback.
 The basic form:
 
 ```bash
-kestrel render input.mid -s soundfont.sf2 -o output.wav
+kestrel render input.mid -s soundfont.sfz -o output.wav
 ```
 
 `-s` takes a `.sf2` or a `.sfz`. Output is 32-bit float WAV by default; pass
