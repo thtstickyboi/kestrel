@@ -1,0 +1,8 @@
+# Keep LF in the repository regardless of the checkout platform. The shaders
+# are include_str!'d into the binary, so line endings are build input.
+* text=auto eol=lf
+
+*.sf2 binary
+*.sfz text eol=lf
+*.mid binary
+*.wav binary

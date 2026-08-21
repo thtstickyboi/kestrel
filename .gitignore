@@ -1,0 +1,8 @@
+/target
+/out
+
+# Written by `kestrel gen-assets`. Hundreds of megabytes of synthetic
+# soundfonts and MIDI, all reproducible; never commit it.
+/tests
+
+*.wav

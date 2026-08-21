@@ -1,0 +1,46 @@
+[package]
+name = "kestrel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["thtstickyboi"]
+description = "GPU-accelerated SoundFont/SFZ synthesizer for black MIDI"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/thtstickyboi/kestrel"
+keywords = ["midi", "synthesizer", "soundfont", "gpu", "wgpu"]
+categories = ["multimedia::audio", "command-line-utilities", "rendering"]
+# Generated test material and the BASSMIDI SDK live in the working tree but are
+# not part of the crate.
+exclude = ["/tests/assets", "/out", "/bassmidi24"]
+
+[lib]
+name = "kestrel"
+# rlib only. The cdylib was staging for a C ABI that is not implemented, and it
+# collides with the bin target's output name.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "kestrel"
+path = "src/bin/kestrel.rs"
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+pollster = "0.4"
+wgpu = "27"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2
