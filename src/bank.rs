@@ -103,7 +103,8 @@ pub struct Region {
     pub filter_q_cb: f32,
     /// SFZ `fil_veltrack`: how far the cutoff opens at full velocity, in
     /// cents. Sampled piano libraries lean on this hard -- the EastWest
-    /// Steinway port sets a cutoff of 89 Hz and a veltrack of 9600, so the
+    /// piano library used for testing sets a cutoff of 89 Hz and a veltrack of
+    /// 9600, so the
     /// velocity is doing eight octaves of the tonal work and ignoring it
     /// leaves every note under an 89 Hz lowpass.
     pub filter_veltrack_cents: f32,
@@ -926,7 +927,7 @@ fn make_params(r: &Region, key: u8, vel: u8, sr: f32, cfg: &Config, m: &ParamMod
     // filter". Running a biquad there would colour every voice for nothing and
     // cost a multiply-add per voice per frame on the device. A veltracked
     // cutoff can climb past it, which is the same statement: at full velocity
-    // the EastWest Steinway asks for 22 kHz, and the right answer is no filter
+    // a sampled piano library here asks for 22 kHz, and the right answer is no filter
     // rather than one sitting on Nyquist.
     let use_filter = cfg.filter_enabled && fc_cents < 13500.0 && fc < nyq_guard && fc > 20.0;
 

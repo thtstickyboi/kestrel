@@ -314,7 +314,7 @@ pub struct Driver {
     /// This block's note-ons, one packed entry each, plus their ordinals.
     ///
     /// A block may hold a hundred times more note-ons than the pool can admit
-    /// -- 98.5M against 1M on `DYHTM Community Merge.mid` -- and admission
+    /// -- 98.5M against 1M on one real file -- and admission
     /// cannot decide anything until the whole block is in, so *something* per
     /// note-on has to be remembered. These two are that something, at 12 bytes
     /// a note-on against the 152 a materialised `SpawnCmd` used to cost in the
@@ -684,7 +684,7 @@ impl Driver {
     /// artifact `spawn_pick` exists to prevent. The top `take` by amplitude has
     /// no reason to be spread across the block, and loud notes cluster in time
     /// -- chords, downbeats -- so the admitted set piled up at the block's
-    /// opening and left its tail thin. Measured on The Nuker 3, which drops 48%
+    /// opening and left its tail thin. Measured on a file that drops 48%
     /// of its voices, that was +6.3 dB at the start of the block against the
     /// block mean, audible as pumping at the block rate.
     ///
@@ -724,7 +724,7 @@ impl Driver {
             // preserve the input order of equal elements, not that it is
             // randomised, and pdqsort has no randomness in it. Sorting the
             // prefix on top of selecting it was about 262k elements per block
-            // for nothing -- measured at **11% of a Hypernova render**, 98.5 s
+            // for nothing -- measured at **11% of a 131 s render**, 98.5 s
             // against 88.5 s over matched three-run samples, which is the
             // entire cost the scrambled tiebreak appeared to introduce.
             //

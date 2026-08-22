@@ -41,7 +41,8 @@ impl OpcodeSet {
     /// `merged` is a flat map, so on its own it cannot tell a region's
     /// `key=22` from a group's `lokey=0 hikey=127`: both survive the merge
     /// and whichever the reader happens to consult last wins, whatever level
-    /// set it. Yamaha C7 writes exactly that pair -- velocity split into 41
+    /// set it. One affected library writes exactly that pair -- velocity split
+    /// into 41
     /// `<group>`s carrying `lokey=0 hikey=127`, each including the same
     /// per-key region list written as `key=N` -- and every one of its regions
     /// came out spanning the whole keyboard, so every note played sixteen
@@ -475,7 +476,7 @@ fn load_sample_channels(
 
 /// Every opcode this loader reads. Anything outside it is dropped, and being
 /// dropped silently is how a soundfont ends up sounding wrong for a session:
-/// the EastWest Steinway port carries `fil_veltrack=9600` against an 89 Hz
+/// a widely used piano port carries `fil_veltrack=9600` against an 89 Hz
 /// cutoff, and without it every note plays under an 89 Hz lowpass. So the set
 /// is written down and what falls outside it is counted and reported.
 const KNOWN_OPCODES: &[&str] = &[

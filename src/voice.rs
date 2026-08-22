@@ -106,7 +106,7 @@ pub fn spawn_pick(i: usize, want: usize, take: usize) -> usize {
 /// The justification was that a note whose note-off already arrived is the
 /// cheapest thing in the block to give up, "because nothing is lost past the
 /// block boundary". That holds only if release is instant. The EastWest
-/// Steinway releases over 0.9 to 4.0 s, and black MIDI notes are a tick long,
+/// sampled piano releases over seconds, and black MIDI notes are a tick long,
 /// so the release tail *is* the sound -- what the bit called disposable is
 /// nearly the whole voice.
 ///
@@ -116,7 +116,7 @@ pub fn spawn_pick(i: usize, want: usize, take: usize) -> usize {
 /// it decided the ranking. A rank that is a function of time, applied inside
 /// time strata whose entire purpose is to keep rank and time independent.
 ///
-/// Measured on Flandre against the EastWest Steinway, 197-203 s, as AM depth
+/// Measured over six seconds of a saturated section, as AM depth
 /// at the block rate: 26.31% before, 16.49% with the tiebreak scrambled, and
 /// **1.23%** once this bit went -- level with the 1.33% that `--admit even`
 /// reaches by not ranking at all. See `PUMPING.md`.
@@ -141,8 +141,8 @@ pub fn admit_key(cmd: &SpawnCmd, index: u64) -> u64 {
 ///
 /// **The raw note id.** Ids are handed out in time order, so every tie
 /// resolved toward the later note -- and ties are not the rare case. Measured
-/// on Flandre against the EastWest Steinway, admitted mean gain equals queued
-/// mean gain to three decimals (selectivity 1.000, and 1.024 on The Nuker 4),
+/// on saturated material, admitted mean gain equals queued
+/// mean gain to three decimals (selectivity 1.000, and 1.024 on a second file),
 /// so the loudness field ties for almost every pair and the tiebreak decides
 /// nearly every comparison. That made the rank a function of *when* a note
 /// arrives, inside time strata whose whole purpose is to keep rank and time
@@ -150,7 +150,7 @@ pub fn admit_key(cmd: &SpawnCmd, index: u64) -> u64 {
 ///
 /// **The bit-reversed index**, a van der Corput spread, on the theory that
 /// selecting an evenly spread subset would beat a random one. It measured
-/// 8.56% against the hash's 8.52% on The Nuker 4 -- no difference -- and it
+/// 8.56% against the hash's 8.52% on a second file -- no difference -- and it
 /// **broke the stereo image**: 3.77 dB of channel imbalance against 0.68 dB
 /// for `AdmitRule::Even`. A stereo library becomes two hard-panned mono
 /// regions, so every note queues two adjacent candidates, left at an even
@@ -180,8 +180,8 @@ pub(crate) fn mix48(index: u64) -> u64 {
 ///
 /// This was `(gain_l + gain_r).clamp(0.0, 1.0) * 32767`, and the clamp was the
 /// whole problem. A loud soundfont at unity volume puts almost every voice
-/// above 1.0, so the field **saturated**: measured on Flandre against the
-/// EastWest Steinway, the queued mean was 32,470 of a possible 32,767 and the
+/// above 1.0, so the field **saturated**: on a loud sampled piano the queued
+/// mean was 32,470 of a possible 32,767 and the
 /// admitted mean was 32,767.00 exactly, a selectivity of 1.009. With the field
 /// carrying no information the key fell through to its tiebreak. A small
 /// `--volume` degenerates the same expression at the other end, collapsing

@@ -221,7 +221,8 @@ pub struct Config {
     /// survive, but the ones that do get to ring. A voice's minimum lifetime is
     /// roughly `100 / steal_percent` blocks. 100 restores the old behaviour.
     ///
-    /// 25 measured best on The Nuker 4. Almost all of the benefit is in
+    /// 25 measured best on the most saturated file tested. Almost all of the
+    /// benefit is in
     /// bounding the churn at all -- 100 -> 25 removes the notch entirely and
     /// takes the block-rate modulation from 32 dB to 23.6 dB, where 10 buys a
     /// further 1 dB and 4 another 1 dB. Below 25 it also gets slower: 10%
@@ -297,7 +298,8 @@ pub struct Config {
     /// transient and sustained passages, and a saturated black MIDI mix has
     /// none: it is sustained throughout, so the slow stage stays engaged and
     /// becomes a second slow-release compressor, putting back the breathing
-    /// the brickwall was there to remove. On The Nuker 4 it took the
+    /// the brickwall was there to remove. On the most saturated file tested it
+    /// took the
     /// block-rate modulation from 8.8 dB back up to 15.4 dB and the 400 ms
     /// loudness variation from 0.090 to 0.134. Kept because material with real
     /// transients is a different question.
