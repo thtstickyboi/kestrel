@@ -31,32 +31,48 @@ fn is_alive(i: u32) -> bool {
 fn scan_local(
     @builtin(local_invocation_index) tid: u32,
     @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let live = state[S_LIVE];
-    let i = wgid.x * WG + tid;
-    var alive = 0u;
-    if (i < live && is_alive(i)) { alive = 1u; }
-
-    sh_scan[tid] = alive;
-    workgroupBarrier();
-
-    // Hillis-Steele inclusive scan. WG is a power of two.
-    var offset = 1u;
+    // One block per WG voices, but the grid is allowed to be smaller than the
+    // block count: a dispatch dimension is capped at 65,535 on D3D12 and the
+    // pool may hold more than that many blocks. A workgroup walks the blocks
+    // it owns. `block` is derived only from workgroup-uniform values, so the
+    // barriers below stay in uniform control flow, and a block's result never
+    // depends on which workgroup drew it, so the output is grid-independent.
+    let blocks = (live + WG - 1u) / WG;
+    var block = wgid.x;
     loop {
-        if (offset >= WG) { break; }
-        var v = 0u;
-        if (tid >= offset) { v = sh_scan[tid - offset]; }
-        workgroupBarrier();
-        sh_scan[tid] = sh_scan[tid] + v;
-        workgroupBarrier();
-        offset = offset << 1u;
-    }
+        if (block >= blocks) { break; }
+        let i = block * WG + tid;
+        var alive = 0u;
+        if (i < live && is_alive(i)) { alive = 1u; }
 
-    if (i < u.capacity) {
-        scan[i] = sh_scan[tid] - alive; // exclusive
-    }
-    if (tid == WG - 1u) {
-        block_sums[wgid.x] = sh_scan[tid];
+        sh_scan[tid] = alive;
+        workgroupBarrier();
+
+        // Hillis-Steele inclusive scan. WG is a power of two.
+        var offset = 1u;
+        loop {
+            if (offset >= WG) { break; }
+            var v = 0u;
+            if (tid >= offset) { v = sh_scan[tid - offset]; }
+            workgroupBarrier();
+            sh_scan[tid] = sh_scan[tid] + v;
+            workgroupBarrier();
+            offset = offset << 1u;
+        }
+
+        if (i < u.capacity) {
+            scan[i] = sh_scan[tid] - alive; // exclusive
+        }
+        if (tid == WG - 1u) {
+            block_sums[block] = sh_scan[tid];
+        }
+        // Nothing after the scan reads another lane's slot, but the next
+        // round overwrites all of them, so hold the whole workgroup here.
+        workgroupBarrier();
+        block = block + nwg.x;
     }
 }
 

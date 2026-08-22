@@ -112,7 +112,16 @@ const S_STOLEN: usize = 8;
 const S_DROPPED: usize = 9;
 const STATE_SLOTS: usize = 16;
 
+/// Largest grid one dispatch dimension may take. This is the D3D12 ceiling and
+/// the wgpu downlevel default, so every adapter reports at least this much. It
+/// bounds the *grid*, not the pool: every per-voice entry point grid-strides,
+/// so a pool with more blocks than this is walked by a grid of this size rather
+/// than rejected.
 const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
+
+/// u32 words the voice pool stores per slot. Mirrors `VOICE_FIELDS` in
+/// `shaders/common.wgsl`; the two have to agree or the SoA stride is wrong.
+const VOICE_FIELDS: u64 = 24;
 
 fn substitute(src: &str, cfg: &Config) -> String {
     src.replace("{{WG}}", &cfg.workgroup_size.to_string())
@@ -264,26 +273,39 @@ impl GpuSynth {
                 limits.max_compute_workgroup_storage_size
             );
         }
-        // Sized from the allocated slots, not from `max_voices`. The pool runs
-        // over the voice ceiling between the spawn and the end-of-block
-        // compaction, while stolen voices fade out alongside their
-        // replacements, and the compaction scan has to cover all of them.
+        // Sizes `block_sums`: one entry per WG-sized block of the pool, counted
+        // from the allocated slots rather than from `max_voices`, because the
+        // pool runs over the voice ceiling between the spawn and the end-of-
+        // block compaction while stolen voices fade out alongside their
+        // replacements, and the scan has to cover all of them. This is not the
+        // dispatch grid -- the scans grid-stride, so it may exceed
+        // `MAX_WORKGROUPS_PER_DIM` and every block still needs its entry.
         let scan_workgroups = cfg.pool_slots().div_ceil(cfg.workgroup_size);
-        if scan_workgroups > MAX_WORKGROUPS_PER_DIM {
-            // The ceiling lands on the allocated slots, so the largest usable
-            // `max_voices` is the one whose steal headroom still fits under it.
-            // Naming the slot ceiling itself sends the caller straight back into
-            // this same error one flag later.
-            let slot_cap = MAX_WORKGROUPS_PER_DIM as u64 * cfg.workgroup_size as u64;
+
+        // What bounds the pool is not the dispatch grid but how much of one
+        // buffer the adapter will bind to a shader at once. The voice pool is a
+        // single storage buffer of `pool_slots * VOICE_FIELDS` words and is the
+        // largest allocation here by an order of magnitude, so it reaches the
+        // ceiling first. That ceiling lands on the allocated slots, so the
+        // largest usable `max_voices` is the one whose steal headroom still fits
+        // under it -- naming the slot ceiling itself would send the caller
+        // straight back into this same error one flag later.
+        let voice_pool_bytes = cfg.pool_slots() as u64 * VOICE_FIELDS * 4;
+        let binding_cap =
+            (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
+        if voice_pool_bytes > binding_cap {
+            let slot_cap = binding_cap / (VOICE_FIELDS * 4);
             let voice_cap = slot_cap * 100 / (100 + cfg.max_steal_percent as u64);
             bail!(
-                "max_voices {} allocates {} pool slots, which needs {} compaction \
-                 workgroups, over the {} limit; cap --max-voices at {} \
-                 (the extra {} slots are the --steal-percent {} fade headroom)",
+                "max_voices {} allocates {} pool slots, a {:.2} GiB voice buffer, and \
+                 {} binds at most {:.2} GiB of one buffer to a shader; cap \
+                 --max-voices at {} (the extra {} slots are the --steal-percent {} \
+                 fade headroom)",
                 cfg.max_voices,
                 cfg.pool_slots(),
-                scan_workgroups,
-                MAX_WORKGROUPS_PER_DIM,
+                voice_pool_bytes as f64 / (1u64 << 30) as f64,
+                adapter_name,
+                binding_cap as f64 / (1u64 << 30) as f64,
                 voice_cap,
                 cfg.max_steal(),
                 cfg.max_steal_percent
@@ -361,8 +383,7 @@ impl GpuSynth {
             })
         };
 
-        // One u32 per field per voice. `VOICE_FIELDS` in shaders/common.wgsl.
-        let voice_bytes = capacity as u64 * 24 * 4;
+        let voice_bytes = capacity as u64 * VOICE_FIELDS * 4;
         let partial_bytes = cfg.block_frames as u64 * 2 * nwg as u64 * 4;
         let out_bytes = cfg.block_frames as u64 * 2 * 4;
         let gates_bytes = tiles as u64 * GATE_SLOTS as u64 * 4;
@@ -906,10 +927,12 @@ impl GpuSynth {
         log::debug!("grew the spawn command buffer to {new_cap} entries");
     }
 
+    /// Workgroups to dispatch for `items` voices. Every entry point this feeds
+    /// grid-strides, so clamping here shortens the grid rather than dropping
+    /// the tail: a pool of any size is walked by whatever grid comes out.
     fn dispatch_count(&self, items: u32) -> u32 {
-        items
-            .div_ceil(self.cfg.workgroup_size)
-            .clamp(1, MAX_WORKGROUPS_PER_DIM)
+        let ceiling = self.cfg.max_pool_workgroups.clamp(1, MAX_WORKGROUPS_PER_DIM);
+        items.div_ceil(self.cfg.workgroup_size).clamp(1, ceiling)
     }
 
     fn map_read(&self, buf: &wgpu::Buffer) -> Result<Vec<u8>> {
@@ -975,7 +998,6 @@ impl Backend for GpuSynth {
 
     fn render(&mut self, out: &mut [f32]) -> Result<()> {
         let cap = self.cfg.max_voices;
-        let wg = self.cfg.workgroup_size;
 
         // More note-ons in one block than the pool can hold is a pathological
         // but legal input. Keep the first `cap` in event order, on both
@@ -1140,15 +1162,17 @@ impl Backend for GpuSynth {
 
         // ---- 5. compact, and re-sort in the same pass ----
         {
+            // One grid for both halves. `dispatch_count` clamps to the grid
+            // ceiling and every entry point below grid-strides, so a pool with
+            // more blocks than the grid is walked, not truncated.
             let live_wgs = self.dispatch_count(self.live);
-            let scan_wgs = self.live.div_ceil(wg).max(1);
             let mut p = begin!(enc, "compact");
 
             // The counting half of the compaction runs either way: it is what
             // produces the live count.
             p.set_bind_group(0, &self.groups[self.parity].compact, &[]);
             p.set_pipeline(&self.pipelines.scan_local);
-            p.dispatch_workgroups(scan_wgs, 1, 1);
+            p.dispatch_workgroups(live_wgs, 1, 1);
             p.set_pipeline(&self.pipelines.scan_blocks);
             p.dispatch_workgroups(1, 1, 1);
 
@@ -1167,7 +1191,7 @@ impl Backend for GpuSynth {
                 for _ in 0..self.sort_key.bits {
                     p.set_bind_group(0, &self.groups[self.parity].sort[pair_parity], &[]);
                     p.set_pipeline(&self.pipelines.sort_scan_local);
-                    p.dispatch_workgroups(scan_wgs, 1, 1);
+                    p.dispatch_workgroups(live_wgs, 1, 1);
                     p.set_pipeline(&self.pipelines.sort_scan_blocks);
                     p.dispatch_workgroups(1, 1, 1);
                     p.set_pipeline(&self.pipelines.sort_split);

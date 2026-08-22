@@ -75,32 +75,43 @@ fn build_keys(
 fn scan_local(
     @builtin(local_invocation_index) tid: u32,
     @builtin(workgroup_id) wgid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
 ) {
     let bit = state[S_SORT_BIT];
     let live = state[S_LIVE];
-    let i = wgid.x * WG + tid;
-
-    var zero = 0u;
-    if (i < live && ((pairs_in[i].x >> bit) & 1u) == 0u) { zero = 1u; }
-
-    sh_scan[tid] = zero;
-    workgroupBarrier();
-    var offset = 1u;
+    // Same grid-stride over blocks as `compact.wgsl::scan_local`, and for the
+    // same reason: the pool may hold more WG-sized blocks than one dispatch
+    // dimension can address.
+    let blocks = (live + WG - 1u) / WG;
+    var block = wgid.x;
     loop {
-        if (offset >= WG) { break; }
-        var v = 0u;
-        if (tid >= offset) { v = sh_scan[tid - offset]; }
-        workgroupBarrier();
-        sh_scan[tid] = sh_scan[tid] + v;
-        workgroupBarrier();
-        offset = offset << 1u;
-    }
+        if (block >= blocks) { break; }
+        let i = block * WG + tid;
 
-    if (i < u.capacity) {
-        scan[i] = sh_scan[tid] - zero;
-    }
-    if (tid == WG - 1u) {
-        block_sums[wgid.x] = sh_scan[tid];
+        var zero = 0u;
+        if (i < live && ((pairs_in[i].x >> bit) & 1u) == 0u) { zero = 1u; }
+
+        sh_scan[tid] = zero;
+        workgroupBarrier();
+        var offset = 1u;
+        loop {
+            if (offset >= WG) { break; }
+            var v = 0u;
+            if (tid >= offset) { v = sh_scan[tid - offset]; }
+            workgroupBarrier();
+            sh_scan[tid] = sh_scan[tid] + v;
+            workgroupBarrier();
+            offset = offset << 1u;
+        }
+
+        if (i < u.capacity) {
+            scan[i] = sh_scan[tid] - zero;
+        }
+        if (tid == WG - 1u) {
+            block_sums[block] = sh_scan[tid];
+        }
+        workgroupBarrier();
+        block = block + nwg.x;
     }
 }
 

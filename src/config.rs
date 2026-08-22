@@ -183,6 +183,15 @@ pub struct Config {
     /// `max_render_workgroups * workgroup_size` are handled by looping inside
     /// the shader. This directly sizes the partial-sum buffer.
     pub max_render_workgroups: u32,
+    /// Upper bound on the grid taken by every *per-voice* pass: spawn, steal
+    /// selection, compaction, and the radix sort. All of them grid-stride over
+    /// the pool, so this decides how many workgroups walk it and never what
+    /// they compute -- which is what lets the pool hold more WG-sized blocks
+    /// than one dispatch dimension can address. `u32::MAX` means "whatever the
+    /// backend's dispatch ceiling is", and the backend clamps to that either
+    /// way. Only the tests set it, to force the striding path on a pool small
+    /// enough to fit on a test machine.
+    pub max_pool_workgroups: u32,
 
     // ---- voice pool ------------------------------------------------------
     /// Hard ceiling on concurrent voices.
@@ -349,6 +358,7 @@ impl Default for Config {
             // reduce pass then has to stream, and which is why this stops
             // rather than doubling again.
             max_render_workgroups: 2048,
+            max_pool_workgroups: u32::MAX,
 
             max_voices: 1 << 20,
             max_layers: 16,

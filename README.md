@@ -91,18 +91,24 @@ land on the slow one by accident.
 
 Kestrel requests whatever limits your adapter reports rather than demanding a
 fixed set, and it checks the ones it can before allocating: if the render pass
-needs more workgroup storage than your card offers, or `--max-voices` implies
-more compaction workgroups than your card allows, it stops and tells you which
-flag to lower. It does not degrade quietly.
+needs more workgroup storage than your card offers, or `--max-voices` implies a
+voice pool larger than your card will bind, it stops and tells you which flag to
+lower. It does not degrade quietly.
 
-That second check is a fixed ceiling rather than a per-card one. The compaction
-scan dispatches one workgroup per `--workgroup` pool slots against a
-65,535-workgroup dispatch limit, and the pool holds `--max-voices` *plus* the
-`--steal-percent` fade headroom, so at the defaults the largest usable value is
-**13,421,568**. The error names the exact figure for whatever `--steal-percent`
-you have set. It caps the pool, not the piece: a file with more simultaneous
-notes than that still renders, with the excess stolen and dropped, which is what
-the pool does at any size.
+That second ceiling is per-card, and it is worth knowing where it comes from.
+The voice pool is one storage buffer, and every adapter caps how much of a
+single buffer a shader may bind at once. At 96 bytes per slot, and with the pool
+holding `--max-voices` *plus* the `--steal-percent` fade headroom, a 2 GiB
+binding limit works out to **17,895,696 voices** at the defaults -- that is what
+an RTX 5060 allows. An Intel RaptorLake-S iGPU reports 1 GiB and so allows
+8,947,848. Kestrel reads the limit off the device, so the error names the figure
+for *your* card and *your* `--steal-percent` rather than a number from this
+page. The dispatch grid is not a factor: every per-voice pass strides over the
+pool, so the grid never has to cover it.
+
+The cap is on the pool, not on the piece. A file with more simultaneous notes
+than the pool holds still renders, with the excess stolen and dropped, which is
+what the pool does at any size.
 
 The GPU is the point, but there is a **complete CPU backend** -- it is the
 reference implementation the GPU path was built against, so it produces correct
@@ -121,8 +127,9 @@ gpu: NVIDIA GeForce RTX 5060 Laptop GPU (Vulkan) | 339.6 MiB of device buffers
 Three things allocate:
 
 - **The voice pool**, sized by `--max-voices`. The default of 1,048,576 costs
-  240 MiB. It scales linearly, so 4M voices costs roughly 960 MiB and the
-  13,421,568 ceiling costs roughly 3 GiB.
+  240 MiB. It scales linearly, so 4M voices costs roughly 960 MiB, and a pool
+  at a 2 GiB binding limit costs 4 GiB here plus 512 MiB of scan and sort
+  scratch.
 - **The partial buffers** used by the mixdown, sized by `--render-workgroups`
   and `--block`. 64 MiB at the defaults.
 - **The sample pool**, which is your entire soundfont resampled to one rate. A
@@ -183,7 +190,7 @@ kestrel render huge.mid -s piano.sfz -o out.wav --limiter brickwall --profile
 | Flag | Default | What it does |
 |---|---|---|
 | `--backend` | `gpu` | `cpu` is the reference implementation: correct, slow, single-threaded. |
-| `--max-voices N` | `1048576` | Ceiling on simultaneous voices. The single biggest lever on both VRAM and speed. Hard maximum 13,421,568 at the default `--steal-percent`. |
+| `--max-voices N` | `1048576` | Ceiling on simultaneous voices. The single biggest lever on both VRAM and speed. The maximum is whatever your card will bind; it is 17,895,696 on an RTX 5060 at the default `--steal-percent`, and the error names yours. |
 | `--interp` | `linear` | `nearest`, `linear` or `cubic`. Cubic costs roughly double the bandwidth. |
 | `--seconds N` | off | Stop after N seconds of output. Use this constantly while experimenting. |
 | `--profile` | off | Per-pass GPU timings, once per wall-clock second. |
@@ -255,6 +262,28 @@ saturated file that is the bigger number by an order of magnitude -- on a
 44.7M-note file against a 32,767-voice pool, 83.7M note-ons were dropped
 against 5.7M voices stolen. Whatever rule governs admission is deciding most of
 what you hear.
+
+How much of that you face at all is a function of pool size, and the pool can be
+far larger than the default. On that same 44.7M-note file against an RTX 5060:
+
+| `--max-voices` | dropped | stolen | realtime |
+|---|---|---|---|
+| 1,048,576 (default) | 18,682,538 | 57,113,653 | 1.43x |
+| 13,421,568 | 0 | 2,732,530 | -- |
+| 17,895,696 | **0** | **0** | 0.67x |
+
+That file's true peak is **14,035,344 simultaneous voices**, and the bottom row
+is the first pool that neither drops nor steals anything: every note sounding,
+none refused and none cut short. It costs 5.3 GiB of VRAM and 2.1x the wall
+time.
+
+Two things are worth taking from the middle row. Admission stops mattering well
+before stealing does -- a pool can admit every note-on and still be under enough
+pressure to steal millions of voices. And an oversized pool costs memory rather
+than time: 17,895,696 slots took 196.4 s against 14,000,000's 196.0 s, a 28%
+larger pool for 0.2% more wall time, because every dispatch is sized from the
+voices that are live and not from the pool. So overshoot `--max-voices` if the
+VRAM is there. It is a far bigger lever than the choice of admission rule.
 
 **`loudest`** (default) cuts an oversubscribed block into 64 time strata and
 ranks *within* each one, so every stratum keeps its own share. Ranking the
