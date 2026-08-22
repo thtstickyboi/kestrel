@@ -221,9 +221,9 @@ alone unless you are measuring.
 ### The other commands
 
 ```bash
-kestrel gpu-info                  # list the GPU adapters wgpu can see
+kestrel gpu-info                  # adapters, their limits, and each one's --max-voices ceiling
 kestrel info file.sf2             # dump what the loader made of a soundfont
-kestrel info file.mid             # ...or of a MIDI: note counts, CC usage, tempo
+kestrel info file.mid             # ...or of a MIDI: note counts, CC usage, tempo, density
 kestrel null a.wav b.wav          # peak difference between two renders, in dB
 kestrel gen-assets dir/           # write synthetic soundfonts and MIDI
 ```
@@ -231,6 +231,34 @@ kestrel gen-assets dir/           # write synthetic soundfonts and MIDI
 `kestrel info` is the first thing to reach for when a render sounds wrong. It
 tells you what Kestrel *thinks* your file contains, which is often not what you
 think it contains.
+
+On a MIDI it also sizes the job before you start it. Pass the settings you mean
+to render with:
+
+```bash
+kestrel info huge.mid --block 512 --layers 2 --release 1.5
+```
+
+```
+at --block 512, --layers 2, 48000 Hz:
+  busiest block        94289755 note-ons, at 286.66s
+  host memory          5.27 GiB for that block, at least
+  peak 1.50s span     386892142 voices, at 285.30s -- roughly what a pool
+                                must hold for nothing to be stolen
+```
+
+The first two lines are the ones that decide whether a render survives: a block
+is admitted whole, so every note-on in it is held until the block ends, and that
+is what a failed allocation is. The third estimates the pool the file wants.
+`--layers` is voices per note-on, one for most black MIDI banks and two for a
+velocity-split piano; `--release` is the soundfont's release time, since in this
+repertoire a voice's life is almost entirely its release tail. On a file whose
+measured requirement was 14,035,344 voices, `--layers 2 --release 1.5` estimates
+13,943,010.
+
+`gpu-info` prints each adapter's `--max-voices` ceiling directly rather than
+leaving you to divide its buffer limit by hand. The voice pool is one storage
+buffer, so how much of one buffer an adapter will bind is what caps the flag.
 
 `gen-assets` writes reproducible synthetic material for benchmarking. Add
 `--big-mb 512` for a sample pool too large to sit in cache, and

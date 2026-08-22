@@ -180,6 +180,16 @@ pub fn print_adapters() -> Result<()> {
             l.max_compute_invocations_per_workgroup,
             l.max_compute_workgroups_per_dimension
         );
+        // The number people actually want off this listing. `gpu-info` used to
+        // print the binding size and leave the division to the reader.
+        let steal = Config::default().max_steal_percent;
+        let binding = (l.max_storage_buffer_binding_size as u64).min(l.max_buffer_size);
+        println!(
+            "    max --max-voices {} at --steal-percent {} ({} pool slots)",
+            crate::gpu::max_voices_for_binding(binding, steal),
+            steal,
+            binding / 96,
+        );
         println!(
             "    subgroups {} | int64 {} | timestamps {}",
             a.features().contains(wgpu::Features::SUBGROUP),

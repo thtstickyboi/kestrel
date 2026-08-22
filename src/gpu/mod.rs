@@ -123,6 +123,22 @@ const MAX_WORKGROUPS_PER_DIM: u32 = 65535;
 /// `shaders/common.wgsl`; the two have to agree or the SoA stride is wrong.
 const VOICE_FIELDS: u64 = 24;
 
+/// The largest `max_voices` an adapter can take, given how much of one buffer
+/// it will bind to a shader.
+///
+/// The voice pool is a single storage buffer of `pool_slots * VOICE_FIELDS`
+/// words, and `pool_slots` is `max_voices` plus its `--steal-percent` fade
+/// headroom, so the ceiling on the flag is the binding limit divided by both.
+///
+/// Shared by the startup check and by `gpu-info`. Two copies of this arithmetic
+/// drifting apart is exactly how the error message once came to recommend a
+/// value that then failed as well.
+pub fn max_voices_for_binding(binding_bytes: u64, steal_percent: u32) -> u32 {
+    let slots = binding_bytes / (VOICE_FIELDS * 4);
+    let v = slots * 100 / (100 + steal_percent.clamp(1, 100) as u64);
+    v.min(u32::MAX as u64) as u32
+}
+
 fn substitute(src: &str, cfg: &Config) -> String {
     src.replace("{{WG}}", &cfg.workgroup_size.to_string())
         .replace("{{TILE}}", &cfg.reduce_tile.to_string())
@@ -294,8 +310,7 @@ impl GpuSynth {
         let binding_cap =
             (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size);
         if voice_pool_bytes > binding_cap {
-            let slot_cap = binding_cap / (VOICE_FIELDS * 4);
-            let voice_cap = slot_cap * 100 / (100 + cfg.max_steal_percent as u64);
+            let voice_cap = max_voices_for_binding(binding_cap, cfg.max_steal_percent);
             bail!(
                 "max_voices {} allocates {} pool slots, a {:.2} GiB voice buffer, and \
                  {} binds at most {:.2} GiB of one buffer to a shader; cap \

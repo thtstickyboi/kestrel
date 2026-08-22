@@ -25,7 +25,25 @@ enum Cmd {
     /// Render a MIDI file to WAV.
     Render(RenderArgs),
     /// Print what the loader made of a soundfont or MIDI file.
-    Info { path: PathBuf },
+    Info {
+        path: PathBuf,
+        /// Frames per render block, for the per-block density report. Match
+        /// what you intend to render with.
+        #[arg(long, default_value_t = 4096)]
+        block: u32,
+        #[arg(long, default_value_t = 48000)]
+        rate: u32,
+        /// Voices each note-on spawns, for the memory projection. One is right
+        /// for most black MIDI soundfonts; a layered bank is higher and the
+        /// figures scale with it.
+        #[arg(long, default_value_t = 1)]
+        layers: u32,
+        /// The soundfont's release time, in seconds. Sets the window the voice
+        /// estimate counts over; a voice outlives its note-off by roughly this
+        /// long, and in black MIDI that is nearly its whole life.
+        #[arg(long, default_value_t = 1.0)]
+        release: f64,
+    },
     /// Compare two WAV files and report the null-test difference.
     Null {
         a: PathBuf,
@@ -228,7 +246,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Render(args) => render(args),
-        Cmd::Info { path } => info(path),
+        Cmd::Info {
+            path,
+            block,
+            rate,
+            layers,
+            release,
+        } => info(path, block, rate, layers, release),
         Cmd::Null { a, b, threshold } => null(a, b, threshold),
         Cmd::GpuInfo => gpu::print_adapters(),
         Cmd::GenAssets {
@@ -344,7 +368,18 @@ fn render(args: RenderArgs) -> Result<()> {
     Ok(())
 }
 
-fn info(path: PathBuf) -> Result<()> {
+fn fmt_bytes(b: u64) -> String {
+    const U: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = b as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < U.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{v:.2} {}", U[i])
+}
+
+fn info(path: PathBuf, block: u32, rate: u32, layers: u32, release: f64) -> Result<()> {
     let cfg = Config::default();
     let ext = path
         .extension()
@@ -358,8 +393,35 @@ fn info(path: PathBuf) -> Result<()> {
         let mut counts = [0u64; 8];
         let mut cc_counts = [0u64; 128];
         let mut last_tick = 0u64;
+
+        // Per-block density. This is the number that decides host memory: a
+        // block is admitted as a whole, so every note-on inside it is held
+        // until the block ends, whether or not the pool can take it.
+        let mut clock = kestrel::midi::TempoClock::new(s.division, rate);
+        let mut cur_block = 0u64;
+        let mut in_block = 0u64;
+        // One note-on count per block, kept so a sliding window over it can
+        // estimate concurrency afterwards.
+        let mut per_block: Vec<u64> = Vec::new();
+
         while let Some((tick, ev)) = s.next() {
             last_tick = tick;
+            if let kestrel::midi::Event::Tempo(us) = ev {
+                clock.set_tempo(tick, us);
+            }
+            let b = clock.frame_at(tick) as u64 / block as u64;
+            if b != cur_block {
+                while per_block.len() as u64 <= cur_block {
+                    per_block.push(0);
+                }
+                per_block[cur_block as usize] = in_block;
+                cur_block = b;
+                in_block = 0;
+            }
+            if matches!(ev, kestrel::midi::Event::NoteOn { .. }) {
+                in_block += 1;
+            }
+
             let i = match ev {
                 kestrel::midi::Event::NoteOn { .. } => 0,
                 kestrel::midi::Event::NoteOff { .. } => 1,
@@ -404,7 +466,78 @@ fn info(path: PathBuf) -> Result<()> {
                 missing as f64 * 100.0 / counts[2] as f64
             );
         }
+        while per_block.len() as u64 <= cur_block {
+            per_block.push(0);
+        }
+        per_block[cur_block as usize] = in_block;
         println!("last tick {last_tick}");
+
+        let (peak_block, peak_at) = per_block
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| (n, i as u64))
+            .max()
+            .unwrap_or((0, 0));
+
+        // Concurrency, as note-ons inside one release window.
+        //
+        // Counting notes between their note-on and note-off measures nothing
+        // here: black MIDI notes are a tick long, so that peaks in the low
+        // hundreds on a file that genuinely needs millions of voices. What
+        // keeps a voice alive is its release tail, and since the notes are far
+        // shorter than the release, "note-ons in the last `release` seconds" is
+        // the estimate that tracks the real pool.
+        let win = ((release * rate as f64) / block as f64).ceil().max(1.0) as usize;
+        let mut sum: u64 = per_block.iter().take(win).sum();
+        let mut peak_win = sum;
+        let mut peak_win_at = 0usize;
+        for i in win..per_block.len() {
+            sum += per_block[i];
+            sum -= per_block[i - win];
+            if sum > peak_win {
+                peak_win = sum;
+                peak_win_at = i + 1 - win;
+            }
+        }
+
+        // 24 B per candidate layer plus 12 B per note-on is what the driver
+        // holds for a block while it waits to admit it. See ADMISSION.md. The
+        // process peak runs above this -- the spawn list, the backend's copy
+        // and the per-track read buffers are all on top, and on the reference
+        // file that came to about 1.35x -- so treat it as a floor.
+        let per_note = 24 * layers as u64 + 12;
+        let bytes = peak_block * per_note;
+        println!();
+        println!("at --block {block}, --layers {layers}, {rate} Hz:");
+        println!(
+            "  busiest block  {:>14} note-ons, at {:.2}s",
+            peak_block,
+            peak_at as f64 * block as f64 / rate as f64
+        );
+        println!("  host memory    {:>14} for that block, at least", fmt_bytes(bytes));
+        println!(
+            "  peak {:.2}s span {:>14} voices, at {:.2}s -- roughly what a pool",
+            release,
+            peak_win * layers as u64,
+            peak_win_at as f64 * block as f64 / rate as f64
+        );
+        println!("                                must hold for nothing to be stolen");
+
+        // Two GiB for one block is where this stops being incidental.
+        const COMFORTABLE: u64 = 2 << 30;
+        if bytes > COMFORTABLE {
+            let mut narrower = block;
+            while narrower > 128 && peak_block * per_note / (block / narrower) as u64 > COMFORTABLE
+            {
+                narrower /= 2;
+            }
+            println!();
+            println!("  That is a lot of host RAM for one block. Note-ons per block scale");
+            println!("  with --block, so --block {narrower} would need about {},", 
+                fmt_bytes(bytes / (block / narrower) as u64));
+            println!("  and 128 is the floor. Lowering --max-voices does not help: the block");
+            println!("  is held in full before admission thins it.");
+        }
         return Ok(());
     }
 
