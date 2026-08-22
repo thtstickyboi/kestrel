@@ -297,6 +297,25 @@ impl MidiStream {
             let len = len.min(avail);
             if &ch[0..4] == b"MTrk" {
                 locs.push((data_start, len));
+            } else if len == 0 {
+                // An unrecognised tag with no body is not a chunk, and the
+                // walk must stop rather than step over it. Exporters pad the
+                // end of a file with zeros, and every 8 zero bytes then parse
+                // as one of these: one real 6.15 GB file carries 1.38 GB of
+                // padding after its last track, which is 172 million
+                // seek-and-read pairs at 8 bytes a step. It finishes
+                // eventually and it looks exactly like a hang -- one core
+                // busy, the disk idle, and nothing logged between the
+                // soundfont and the track count.
+                let trailing = file_len - offset;
+                if trailing > 0 {
+                    log::warn!(
+                        "{}: {} bytes after the last chunk are not chunks; ignored",
+                        path.display(),
+                        trailing
+                    );
+                }
+                break;
             }
             offset = data_start + len;
         }
@@ -486,3 +505,4 @@ fn write_varlen(buf: &mut Vec<u8>, mut v: u64) {
         buf.push(stack[i]);
     }
 }
+
