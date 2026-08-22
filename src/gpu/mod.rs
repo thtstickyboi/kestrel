@@ -270,13 +270,23 @@ impl GpuSynth {
         // replacements, and the compaction scan has to cover all of them.
         let scan_workgroups = cfg.pool_slots().div_ceil(cfg.workgroup_size);
         if scan_workgroups > MAX_WORKGROUPS_PER_DIM {
+            // The ceiling lands on the allocated slots, so the largest usable
+            // `max_voices` is the one whose steal headroom still fits under it.
+            // Naming the slot ceiling itself sends the caller straight back into
+            // this same error one flag later.
+            let slot_cap = MAX_WORKGROUPS_PER_DIM as u64 * cfg.workgroup_size as u64;
+            let voice_cap = slot_cap * 100 / (100 + cfg.max_steal_percent as u64);
             bail!(
-                "max_voices {} needs {} compaction workgroups, over the {} limit; \
-                 cap --max-voices at {}",
+                "max_voices {} allocates {} pool slots, which needs {} compaction \
+                 workgroups, over the {} limit; cap --max-voices at {} \
+                 (the extra {} slots are the --steal-percent {} fade headroom)",
                 cfg.max_voices,
+                cfg.pool_slots(),
                 scan_workgroups,
                 MAX_WORKGROUPS_PER_DIM,
-                MAX_WORKGROUPS_PER_DIM * cfg.workgroup_size
+                voice_cap,
+                cfg.max_steal(),
+                cfg.max_steal_percent
             );
         }
         if cfg.block_frames * 2 > MAX_WORKGROUPS_PER_DIM {

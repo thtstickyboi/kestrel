@@ -95,6 +95,15 @@ needs more workgroup storage than your card offers, or `--max-voices` implies
 more compaction workgroups than your card allows, it stops and tells you which
 flag to lower. It does not degrade quietly.
 
+That second check is a fixed ceiling rather than a per-card one. The compaction
+scan dispatches one workgroup per `--workgroup` pool slots against a
+65,535-workgroup dispatch limit, and the pool holds `--max-voices` *plus* the
+`--steal-percent` fade headroom, so at the defaults the largest usable value is
+**13,421,568**. The error names the exact figure for whatever `--steal-percent`
+you have set. It caps the pool, not the piece: a file with more simultaneous
+notes than that still renders, with the excess stolen and dropped, which is what
+the pool does at any size.
+
 The GPU is the point, but there is a **complete CPU backend** -- it is the
 reference implementation the GPU path was built against, so it produces correct
 output on any machine. It is far slower and it is single-threaded. Use
@@ -112,7 +121,8 @@ gpu: NVIDIA GeForce RTX 5060 Laptop GPU (Vulkan) | 339.6 MiB of device buffers
 Three things allocate:
 
 - **The voice pool**, sized by `--max-voices`. The default of 1,048,576 costs
-  240 MiB. It scales linearly, so 4M voices costs roughly 960 MiB.
+  240 MiB. It scales linearly, so 4M voices costs roughly 960 MiB and the
+  13,421,568 ceiling costs roughly 3 GiB.
 - **The partial buffers** used by the mixdown, sized by `--render-workgroups`
   and `--block`. 64 MiB at the defaults.
 - **The sample pool**, which is your entire soundfont resampled to one rate. A
@@ -173,7 +183,7 @@ kestrel render huge.mid -s piano.sfz -o out.wav --limiter brickwall --profile
 | Flag | Default | What it does |
 |---|---|---|
 | `--backend` | `gpu` | `cpu` is the reference implementation: correct, slow, single-threaded. |
-| `--max-voices N` | `1048576` | Ceiling on simultaneous voices. The single biggest lever on both VRAM and speed. |
+| `--max-voices N` | `1048576` | Ceiling on simultaneous voices. The single biggest lever on both VRAM and speed. Hard maximum 13,421,568 at the default `--steal-percent`. |
 | `--interp` | `linear` | `nearest`, `linear` or `cubic`. Cubic costs roughly double the bandwidth. |
 | `--seconds N` | off | Stop after N seconds of output. Use this constantly while experimenting. |
 | `--profile` | off | Per-pass GPU timings, once per wall-clock second. |
