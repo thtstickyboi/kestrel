@@ -256,6 +256,18 @@ repertoire a voice's life is almost entirely its release tail. On a file whose
 measured requirement was 14,035,344 voices, `--layers 2 --release 1.5` estimates
 13,943,010.
 
+**When to stop using the defaults.** Read those three lines and act on them:
+
+| what `info` says | what to do |
+|---|---|
+| peak span under `--max-voices` | nothing. The defaults will not drop or steal a single voice |
+| peak span above it | raise `--max-voices` towards that figure, up to the ceiling `gpu-info` prints for your card |
+| host memory in the gigabytes | lower `--block`. Not `--max-voices` -- that does not help |
+
+For anything that is not black MIDI the first row is the answer and there is
+nothing to tune: a pool that never fills means admission and voice stealing
+never run at all.
+
 `gpu-info` prints each adapter's `--max-voices` ceiling directly rather than
 leaving you to divide its buffer limit by hand. The voice pool is one storage
 buffer, so how much of one buffer an adapter will bind is what caps the flag.
