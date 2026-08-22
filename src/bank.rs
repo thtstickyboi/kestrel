@@ -71,6 +71,10 @@ pub struct Region {
     /// Cents of pitch change per key. 100 is normal, 0 pins the pitch.
     pub scale_tuning: i16,
     pub attenuation_cb: f32,
+    /// SFZ `amp_veltrack`, in percent. 100 is full velocity tracking, 0 pins
+    /// every note at full amplitude. SF2 has no equivalent and leaves it at
+    /// 100, which is the SF2 default velocity-to-attenuation modulator.
+    pub amp_veltrack: f32,
     /// -1.0 hard left to 1.0 hard right.
     pub pan: f32,
     pub loop_mode: LoopMode,
@@ -128,6 +132,7 @@ impl Default for Region {
             fine_tune: 0,
             scale_tuning: 100,
             attenuation_cb: 0.0,
+            amp_veltrack: 100.0,
             pan: 0.0,
             loop_mode: LoopMode::NoLoop,
             addr_start: 0,
@@ -462,15 +467,46 @@ pub fn cb_to_gain(cb: f32) -> f32 {
     (10.0f32).powf(-cb / 200.0)
 }
 
-/// Velocity to attenuation, in centibels.
+/// Velocity to attenuation, in centibels, scaled by SFZ `amp_veltrack`.
 ///
-/// Amplitude tracks (vel/127)^2, which is the usual reading of the SF2 default
-/// velocity-to-initial-attenuation modulator and matches what FluidSynth does
-/// closely enough to be indistinguishable in a listening test.
+/// At the default `veltrack` of 100 the amplitude tracks (vel/127)^2, which is
+/// the usual reading of the SF2 default velocity-to-initial-attenuation
+/// modulator and matches what FluidSynth does closely enough to be
+/// indistinguishable in a listening test.
+///
+/// `veltrack` interpolates that curve against unity gain:
+///
+/// ```text
+/// gain = 1 - veltrack/100 * (1 - (vel/127)^2)
+/// ```
+///
+/// so 0 leaves every note at full amplitude and 100 is the curve above. A
+/// library that splits by velocity has already spent velocity on choosing the
+/// layer and sets `amp_veltrack=0` so it is not spent twice; applying the
+/// curve regardless is what made its quiet layers quieter than intended.
+///
+/// Negative values invert instead of reflecting, because reflecting would push
+/// the gain above unity and no library means that by `amp_veltrack=-100`.
 #[inline]
-pub fn velocity_atten_cb(vel: u8) -> f32 {
+pub fn velocity_atten_cb(vel: u8, veltrack: f32) -> f32 {
     let v = vel.max(1) as f32 / 127.0;
-    (-400.0 * v.log10()).clamp(0.0, 960.0)
+    let t = veltrack.clamp(-100.0, 100.0) / 100.0;
+    if t == 1.0 {
+        // Full tracking is the SF2 path and the SFZ default, so it keeps the
+        // original expression rather than the equivalent one below. They agree
+        // mathematically but not to the last bit of an f32, and every render
+        // made before `amp_veltrack` existed went through this line.
+        return (-400.0 * v.log10()).clamp(0.0, 960.0);
+    }
+    let gain = if t >= 0.0 {
+        1.0 - t * (1.0 - v * v)
+    } else {
+        1.0 + t * v * v
+    };
+    if gain <= 0.0 {
+        return 960.0;
+    }
+    (-200.0 * gain.log10()).clamp(0.0, 960.0)
 }
 
 impl Bank {
@@ -596,7 +632,7 @@ impl Bank {
             return None;
         }
 
-        let atten = r.attenuation_cb + velocity_atten_cb(eff_vel);
+        let atten = r.attenuation_cb + velocity_atten_cb(eff_vel, r.amp_veltrack);
         let gain = cb_to_gain(atten) * cfg.master_volume;
 
         // Constant-power pan.
@@ -700,7 +736,7 @@ impl Bank {
             let (pan_l, pan_r) = (theta.cos(), theta.sin());
             for v in 0..128u8 {
                 let eff_vel = if r.fixed_vel >= 0 { r.fixed_vel as u8 } else { v };
-                let atten = r.attenuation_cb + velocity_atten_cb(eff_vel);
+                let atten = r.attenuation_cb + velocity_atten_cb(eff_vel, r.amp_veltrack);
                 let gain = cb_to_gain(atten) * cfg.master_volume;
                 self.gain_table[ri * 128 + v as usize] = [gain * pan_l, gain * pan_r];
             }
@@ -947,11 +983,33 @@ mod tests {
 
     #[test]
     fn velocity_curve_is_sane() {
-        assert!(velocity_atten_cb(127) < 0.01);
+        assert!(velocity_atten_cb(127, 100.0) < 0.01);
         // Half velocity should be around -12 dB, not -48 and not -3.
-        let cb = velocity_atten_cb(64);
+        let cb = velocity_atten_cb(64, 100.0);
         assert!((100.0..140.0).contains(&cb), "vel 64 gave {cb} cB");
-        assert!(velocity_atten_cb(1) >= 800.0);
+        assert!(velocity_atten_cb(1, 100.0) >= 800.0);
+    }
+
+    #[test]
+    fn amp_veltrack_scales_the_velocity_curve() {
+        // 0 means velocity does not touch the amplitude at all.
+        for vel in [1u8, 40, 64, 100, 127] {
+            assert_eq!(velocity_atten_cb(vel, 0.0), 0.0, "vel {vel} at veltrack 0");
+        }
+        // Half tracking sits between no tracking and full, at every velocity.
+        for vel in [1u8, 40, 64, 100] {
+            let half = velocity_atten_cb(vel, 50.0);
+            assert!(
+                half > 0.0 && half < velocity_atten_cb(vel, 100.0),
+                "vel {vel} gave {half} cB at veltrack 50"
+            );
+        }
+        // Full velocity is unattenuated whatever the tracking.
+        assert!(velocity_atten_cb(127, 50.0) < 0.01);
+        // Negative inverts: loud notes are the quiet ones, and nothing is
+        // ever amplified above unity.
+        assert!(velocity_atten_cb(127, -100.0) >= 960.0);
+        assert!(velocity_atten_cb(1, -100.0) < 0.01);
     }
 
     #[test]

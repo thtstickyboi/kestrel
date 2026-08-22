@@ -544,6 +544,9 @@ fn build_region(g: &[i16; GEN_COUNT], sample: u32, key: (u8, u8), vel: (u8, u8))
         fine_tune: g[G_FINE_TUNE as usize],
         scale_tuning: g[G_SCALE_TUNING as usize],
         attenuation_cb: g[G_INITIAL_ATTENUATION as usize] as f32,
+        // SF2 has no `amp_veltrack`; its velocity-to-attenuation
+        // modulator is exactly the full-tracking case.
+        amp_veltrack: 100.0,
         pan: (g[G_PAN as usize] as f32 / 500.0).clamp(-1.0, 1.0),
         loop_mode: match g[G_SAMPLE_MODES as usize] & 3 {
             1 => LoopMode::Continuous,

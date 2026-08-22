@@ -35,6 +35,38 @@ impl OpcodeSet {
     fn get(&self, k: &str) -> Option<&str> {
         self.0.get(k).map(|s| s.as_str())
     }
+    /// Collapse aliased opcodes to one canonical name, at the level that
+    /// wrote them and before any inheritance happens.
+    ///
+    /// `merged` is a flat map, so on its own it cannot tell a region's
+    /// `key=22` from a group's `lokey=0 hikey=127`: both survive the merge
+    /// and whichever the reader happens to consult last wins, whatever level
+    /// set it. Yamaha C7 writes exactly that pair -- velocity split into 41
+    /// `<group>`s carrying `lokey=0 hikey=127`, each including the same
+    /// per-key region list written as `key=N` -- and every one of its regions
+    /// came out spanning the whole keyboard, so every note played sixteen
+    /// layers of the wrong sample. Collapsing here means the merge only ever
+    /// sees one name per property, and normal region-over-group precedence
+    /// applies.
+    fn canonicalise(&mut self) {
+        if let Some(k) = self.0.remove("key") {
+            for alias in ["lokey", "hikey", "pitch_keycenter"] {
+                // An explicit sibling at this same level still wins, which is
+                // what `key=60 pitch_keycenter=62` is written to mean.
+                self.0.entry(alias.to_string()).or_insert_with(|| k.clone());
+            }
+        }
+        for (from, to) in [
+            ("loopmode", "loop_mode"),
+            ("loopstart", "loop_start"),
+            ("loopend", "loop_end"),
+            ("pitch", "tune"),
+        ] {
+            if let Some(v) = self.0.remove(from) {
+                self.0.entry(to.to_string()).or_insert(v);
+            }
+        }
+    }
     fn f32(&self, k: &str) -> Option<f32> {
         self.get(k).and_then(|v| v.trim().parse::<f32>().ok())
     }
@@ -84,16 +116,18 @@ fn parse_note_name(s: &str) -> Option<i32> {
 
 struct Parser {
     root: PathBuf,
-    default_path: PathBuf,
     unknown: HashMap<String, u32>,
     depth: u32,
 }
 
 impl Parser {
-    fn resolve(&self, rel: &str) -> PathBuf {
+    /// `default_path` is passed in rather than held on the parser because it
+    /// is positional: a file may carry several `<control>` sections and each
+    /// governs the regions that follow it, not the whole file.
+    fn resolve(&self, default_path: &Path, rel: &str) -> PathBuf {
         // SFZ paths use backslashes on Windows-authored libraries.
         let rel = rel.replace('\\', "/");
-        let joined = self.default_path.join(&rel);
+        let joined = default_path.join(&rel);
         let cand = self.root.join(&joined);
         if cand.exists() {
             return cand;
@@ -131,7 +165,8 @@ impl Parser {
             }
             if let Some(rest) = line.strip_prefix("#include") {
                 let inc = rest.trim().trim_matches('"').trim();
-                let p = self.resolve(inc);
+                // `default_path` governs `sample`, not `#include`.
+                let p = self.resolve(Path::new(""), inc);
                 if started {
                     out.push((current_header.clone(), std::mem::take(&mut current)));
                     started = false;
@@ -229,40 +264,52 @@ pub fn load(path: impl AsRef<Path>, cfg: &Config) -> Result<Bank> {
 
     let mut parser = Parser {
         root: root.clone(),
-        default_path: PathBuf::new(),
         unknown: HashMap::new(),
         depth: 0,
     };
 
-    // First pass just to pick up <control> default_path, which can appear
-    // before any region but affects every sample path.
     let mut sections: Vec<(String, OpcodeSet)> = Vec::new();
     parser.parse_file(path, &mut sections)?;
-    for (h, ops) in &sections {
-        if h == "control" {
-            if let Some(dp) = ops.get("default_path") {
-                parser.default_path = PathBuf::from(dp.replace('\\', "/"));
-            }
-        }
+    for (_, ops) in &mut sections {
+        ops.canonicalise();
     }
 
+    // One walk in file order, carrying everything a region inherits.
+    // `default_path` is part of that: a library split into sections by sample
+    // folder writes a `<control>` before each, and folding them all up front
+    // made the last one govern every region in the file. That loads without
+    // complaining, because the wrong sample is still a sample that exists.
+    let mut default_path = PathBuf::new();
     let mut global = OpcodeSet::default();
+    let mut master = OpcodeSet::default();
     let mut group = OpcodeSet::default();
-    let mut region_sets: Vec<OpcodeSet> = Vec::new();
+    let mut region_sets: Vec<(PathBuf, OpcodeSet)> = Vec::new();
 
     for (h, ops) in &sections {
         match h.as_str() {
+            "control" => {
+                if let Some(dp) = ops.get("default_path") {
+                    default_path = PathBuf::from(dp.replace('\\', "/"));
+                }
+            }
             "global" => {
                 global = ops.clone();
+                master = OpcodeSet::default();
                 group = OpcodeSet::default();
             }
+            // A `<master>` replaces the previous one. Merging it into `global`
+            // instead let its opcodes outlive it and reach the regions of the
+            // master that followed.
             "master" => {
+                master = ops.clone();
                 group = OpcodeSet::default();
-                global = global.merged(ops);
             }
             "group" => group = ops.clone(),
-            "region" => region_sets.push(global.merged(&group).merged(ops)),
-            "control" | "curve" | "effect" => {}
+            "region" => region_sets.push((
+                default_path.clone(),
+                global.merged(&master).merged(&group).merged(ops),
+            )),
+            "curve" | "effect" => {}
             other => {
                 *parser.unknown.entry(format!("<{other}>")).or_default() += 1;
             }
@@ -283,14 +330,14 @@ pub fn load(path: impl AsRef<Path>, cfg: &Config) -> Result<Bank> {
     let mut regions: Vec<Region> = Vec::new();
     let mut region_ids: Vec<u32> = Vec::new();
 
-    for ops in &region_sets {
+    for (default_path, ops) in &region_sets {
         let Some(sample_rel) = ops.get("sample") else {
             continue;
         };
         if ops.i32("end") == Some(-1) {
             continue; // conventional way to disable a region
         }
-        let spath = parser.resolve(sample_rel);
+        let spath = parser.resolve(default_path, sample_rel);
         let channels = match load_sample_channels(
             &spath,
             &mut pool,
@@ -307,7 +354,12 @@ pub fn load(path: impl AsRef<Path>, cfg: &Config) -> Result<Bank> {
 
         for (ch, sidx) in channels.iter().enumerate() {
             note_unhandled(ops, &mut parser.unknown);
-            let mut r = region_from_opcodes(ops, *sidx, &samples[*sidx as usize]);
+            let mut extra = Vec::new();
+            let mut r =
+                region_from_opcodes(ops, *sidx, &samples[*sidx as usize], &mut extra);
+            for what in extra {
+                *parser.unknown.entry(what.to_string()).or_default() += 1;
+            }
             if channels.len() == 2 {
                 // Hard pan the two halves of a stereo file, then let the
                 // region's own pan bias the pair.
@@ -438,7 +490,9 @@ const KNOWN_OPCODES: &[&str] = &[
     "pitch",
     "transpose",
     "volume",
+    "amp_veltrack",
     "pan",
+    "pitch_keytrack",
     "loop_mode",
     "loopmode",
     "loop_start",
@@ -478,18 +532,19 @@ fn note_unhandled(ops: &OpcodeSet, unknown: &mut HashMap<String, u32>) {
     }
 }
 
-fn region_from_opcodes(ops: &OpcodeSet, sample: u32, info: &SampleInfo) -> Region {
+fn region_from_opcodes(
+    ops: &OpcodeSet,
+    sample: u32,
+    info: &SampleInfo,
+    unhandled: &mut Vec<&'static str>,
+) -> Region {
     let mut r = Region {
         sample,
         ..Default::default()
     };
 
-    if let Some(k) = ops.key("key") {
-        let k = k.clamp(0, 127) as u8;
-        r.key_lo = k;
-        r.key_hi = k;
-        r.root_key_override = k as i16;
-    }
+    // `key` is gone by now: `canonicalise` expanded it into the three
+    // opcodes below at the level that wrote it.
     if let Some(k) = ops.key("lokey") {
         r.key_lo = k.clamp(0, 127) as u8;
     }
@@ -509,7 +564,7 @@ fn region_from_opcodes(ops: &OpcodeSet, sample: u32, info: &SampleInfo) -> Regio
         r.vel_hi = v.clamp(0, 127) as u8;
     }
 
-    let tune = ops.f32("tune").or_else(|| ops.f32("pitch")).unwrap_or(0.0);
+    let tune = ops.f32("tune").unwrap_or(0.0);
     r.fine_tune = tune.round().clamp(-32768.0, 32767.0) as i16;
     if let Some(t) = ops.i32("transpose") {
         r.coarse_tune = t.clamp(-127, 127) as i16;
@@ -523,6 +578,9 @@ fn region_from_opcodes(ops: &OpcodeSet, sample: u32, info: &SampleInfo) -> Regio
     }
     if let Some(p) = ops.f32("pan") {
         r.pan = (p / 100.0).clamp(-1.0, 1.0);
+    }
+    if let Some(v) = ops.f32("amp_veltrack") {
+        r.amp_veltrack = v.clamp(-100.0, 100.0);
     }
 
     r.loop_mode = match ops.get("loop_mode").unwrap_or("") {
@@ -543,16 +601,29 @@ fn region_from_opcodes(ops: &OpcodeSet, sample: u32, info: &SampleInfo) -> Regio
     if let Some(o) = ops.i32("offset") {
         r.addr_start = o.max(0);
     }
+    // These four opcodes are absolute positions in source frames, but the
+    // `Region` stores offsets from the sample's own points, and `build_voice`
+    // scales those offsets by the resample ratio before applying them. So the
+    // subtraction has to happen in source frames too: the sample's points are
+    // already at pool rate, and mixing the two put an overridden loop up to a
+    // resample ratio's worth of frames off its mark.
+    let to_source = |resampled: u32| {
+        if info.resample_ratio > 0.0 {
+            (resampled as f32 / info.resample_ratio).round() as i32
+        } else {
+            resampled as i32
+        }
+    };
     if let Some(e) = ops.i32("end") {
         if e > 0 {
-            r.addr_end = e - info.len as i32;
+            r.addr_end = e - to_source(info.len);
         }
     }
     if let Some(ls) = ops.i32("loop_start") {
-        r.addr_loop_start = ls - info.loop_start as i32;
+        r.addr_loop_start = ls - to_source(info.loop_start);
     }
     if let Some(le) = ops.i32("loop_end") {
-        r.addr_loop_end = le - info.loop_end as i32;
+        r.addr_loop_end = le - to_source(info.loop_end);
     }
 
     r.delay = ops.f32("ampeg_delay").unwrap_or(0.0).max(0.0);
@@ -582,8 +653,19 @@ fn region_from_opcodes(ops: &OpcodeSet, sample: u32, info: &SampleInfo) -> Regio
             r.filter_veltrack_cents = 0.0;
         }
     }
-    if let Some(g) = ops.i32("group") {
-        r.exclusive_class = g.clamp(0, 255) as u8;
+    // In SFZ `group` only labels; `off_by` is what mutes. The two together,
+    // naming the same number, are the self-exclusive case that
+    // `exclusive_class` already implements. `group` on its own used to switch
+    // exclusion on by itself, which mutes notes the library meant to keep.
+    let group_id = ops.i32("group").unwrap_or(0).clamp(0, 255);
+    match ops.i32("off_by") {
+        Some(off) if off.clamp(0, 255) == group_id && group_id > 0 => {
+            r.exclusive_class = group_id as u8;
+        }
+        // Muting a *different* group is a thing this engine cannot express,
+        // so it is reported rather than approximated by self-exclusion.
+        Some(_) => unhandled.push("off_by (cross-group, not implemented)"),
+        None => {}
     }
 
     r
