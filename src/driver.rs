@@ -6,7 +6,7 @@
 //! test meaningful: the two backends see byte-identical input.
 
 use crate::backend::Backend;
-use crate::bank::{Bank, ParamMod, VoiceSpawn};
+use crate::bank::{Bank, ParamMod, PreviewLayer, VoiceSpawn};
 use crate::config::{AdmitRule, Config};
 use crate::limiter::{clamp_block, Brickwall, Limiter, LimiterMode};
 use crate::midi::{Event, MidiStream, TempoClock};
@@ -155,12 +155,75 @@ pub struct DriverStats {
     pub frames: u64,
     pub blocks: u64,
     pub events: u64,
+    /// Note-ons the block could not admit. Counted here rather than in the
+    /// backends because admission now happens before a voice is built, so a
+    /// backend never sees the ones that were refused.
+    pub dropped: u64,
     pub notes: u64,
     pub voices_spawned: u64,
     pub peak: f32,
     /// Samples the final clamp had to pull back to full scale. Every run of
     /// these is a squared-off waveform top, which is what a click sounds like.
     pub clipped: u64,
+}
+
+/// Pack a note-on into one word: everything `build_layer` and `SpawnCmd` will
+/// need if the note survives admission, minus the ordinal, which is a u32 of
+/// its own because it does not fit alongside the rest.
+///
+/// `rel` is bounded by `block_frames` and `variant` by the 64 params slots;
+/// `Config::validate` holds both inside the widths used here rather than
+/// leaving the masks to truncate silently.
+#[inline]
+fn note_pack(ch: u8, key: u8, vel: u8, variant: u32, rel: u32) -> u64 {
+    debug_assert!(variant < 64 && rel < 65536);
+    (ch as u64 & 0xF)
+        | ((key as u64 & 0x7F) << 4)
+        | ((vel as u64 & 0x7F) << 11)
+        | ((variant as u64 & 0x3F) << 18)
+        | ((rel as u64 & 0xFFFF) << 24)
+}
+
+#[inline]
+fn note_unpack(w: u64) -> (u8, u8, u8, u32, u32) {
+    (
+        (w & 0xF) as u8,
+        ((w >> 4) & 0x7F) as u8,
+        ((w >> 11) & 0x7F) as u8,
+        ((w >> 18) & 0x3F) as u32,
+        ((w >> 24) & 0xFFFF) as u32,
+    )
+}
+
+/// One layer a block might admit, before anything has been built for it.
+///
+/// `key` is `voice::admit_key` with the sustained bit still clear, because
+/// whether a note is still sounding at the end of the block is not known until
+/// the block's last event is in. It is bit 63, so it ORs in later without
+/// disturbing the gain or the id beneath it.
+#[derive(Clone, Copy)]
+struct Cand {
+    key: u64,
+    /// Index into `notes`, or `DEFERRED` for a voice built in an earlier block
+    /// whose delay lands in this one.
+    note: u32,
+    /// The region to build, so materialising never has to preview again. For a
+    /// `DEFERRED` candidate this is the index into `deferred_now` instead.
+    region: u32,
+    /// Note id, as an offset from `block_first_id`. Unused when `DEFERRED`,
+    /// whose command already carries its id.
+    id_off: u32,
+}
+
+/// `Cand::note` for a candidate that came off the deferred queue.
+const DEFERRED: u32 = u32::MAX;
+
+/// `admit_key` without the sustained bit.
+#[inline]
+fn rank_key(gain_l: f32, gain_r: f32, id: u64) -> u64 {
+    let gain = (gain_l.abs() + gain_r.abs()).clamp(0.0, 1.0);
+    let q = (gain * 32767.0) as u32 as u64;
+    (q << 48) | (id & 0x0000_FFFF_FFFF_FFFF)
 }
 
 pub struct Driver {
@@ -237,7 +300,28 @@ pub struct Driver {
     tail_blocks_left: u64,
 
     spawn_buf: Vec<SpawnCmd>,
-    voice_buf: Vec<VoiceSpawn>,
+    /// This block's note-ons, one packed entry each, plus their ordinals.
+    ///
+    /// A block may hold a hundred times more note-ons than the pool can admit
+    /// -- 98.5M against 1M on `DYHTM Community Merge.mid` -- and admission
+    /// cannot decide anything until the whole block is in, so *something* per
+    /// note-on has to be remembered. These two are that something, at 12 bytes
+    /// a note-on against the 152 a materialised `SpawnCmd` used to cost in the
+    /// driver and the backend together.
+    notes: Vec<u64>,
+    note_ordinal: Vec<u32>,
+    /// One entry per admissible layer this block. See `Cand`.
+    cands: Vec<Cand>,
+    /// This block's share of the deferred queue, already built. Kept apart from
+    /// `spawn_buf` so that admission ranks over one list and `spawn_buf` can be
+    /// filled with the winners alone.
+    deferred_now: Vec<SpawnCmd>,
+    /// Scratch for `Bank::preview_note_on`.
+    preview_buf: Vec<PreviewLayer>,
+    /// Note id of this block's first candidate. Ids are handed out in
+    /// candidate order, so a candidate's id is this plus its index and does
+    /// not have to be stored.
+    block_first_id: u64,
     /// Voices whose SF2 delay pushes their start past this block.
     deferred: Vec<(u64, SpawnCmd)>,
 
@@ -302,7 +386,12 @@ impl Driver {
             tail_blocks_left: (MAX_TAIL_SECONDS * cfg.sample_rate as f64
                 / cfg.block_frames as f64) as u64,
             spawn_buf: Vec::new(),
-            voice_buf: Vec::new(),
+            notes: Vec::new(),
+            note_ordinal: Vec::new(),
+            cands: Vec::new(),
+            deferred_now: Vec::new(),
+            preview_buf: Vec::new(),
+            block_first_id: 0,
             deferred: Vec::new(),
             stats: DriverStats::default(),
         };
@@ -353,15 +442,33 @@ impl Driver {
             self.variant_used |= 1u64 << v;
         }
         self.spawn_buf.clear();
+        self.notes.clear();
+        self.note_ordinal.clear();
+        self.cands.clear();
+        self.deferred_now.clear();
+        self.block_first_id = self.next_note_id;
         self.spawn_variants = false;
 
-        // Voices whose delay landed them in this block.
+        // Voices whose delay landed them in this block. They are already
+        // built, so they enter admission as candidates that point at
+        // `deferred_now` rather than at a note-on to be previewed.
         let mut i = 0;
         while i < self.deferred.len() {
             if self.deferred[i].0 < block_end {
                 let (frame, mut cmd) = self.deferred.swap_remove(i);
                 cmd.start_rel = frame.saturating_sub(block_start) as u32;
-                self.queue_spawn(cmd);
+                if cmd.variant != 0 {
+                    self.variant_used |= 1u64 << cmd.variant;
+                    self.spawn_variants = true;
+                }
+                let id = ((cmd.note_id_hi as u64) << 32) | cmd.note_id_lo as u64;
+                self.cands.push(Cand {
+                    key: rank_key(cmd.gain_l, cmd.gain_r, id),
+                    note: DEFERRED,
+                    region: self.deferred_now.len() as u32,
+                    id_off: 0,
+                });
+                self.deferred_now.push(cmd);
             } else {
                 i += 1;
             }
@@ -430,87 +537,41 @@ impl Driver {
             // controller path stays on for it.
             self.chan.variant_active() || self.spawn_variants,
         )?;
-        // Rank the block before the backend thins it. Sorted here rather than
-        // in each backend so the two cannot disagree, and after the whole
-        // block's events are in so `released` sees every note-off that landed
-        // inside it. A voice's position in time rides on `start_rel`, so
-        // reordering the queue changes only which notes survive, never when
-        // the survivors sound.
-        if self.cfg.admit_rule == AdmitRule::Loudest && !self.spawn_buf.is_empty() {
-            let live = backend.stats().active_voices as u32;
-            let want = self.spawn_buf.len();
-            let take = self.cfg.admit_take(live, want as u32) as usize;
-            // A block that fits needs no ranking at all: nothing is dropped,
-            // so the order it goes in is the order it came in.
-            if take < want && take > 0 {
-                let gates = &self.gates;
-                // Rank *within* `spawn_pick`'s time slices, not across the
-                // whole block.
-                //
-                // Ranking globally was the first attempt and it reintroduced
-                // exactly the artifact `spawn_pick` exists to prevent. The top
-                // `take` by amplitude has no reason to be spread across the
-                // block, and loud notes cluster in time -- chords, downbeats --
-                // so the admitted set piled up at the block's opening and left
-                // its tail thin. Measured on The Nuker 3, which drops 48% of
-                // its voices, that was +6.3 dB at the start of the block
-                // against the block mean, audible as pumping at the block rate.
-                //
-                // The slices decide *when*, exactly as before; the key decides
-                // *which note within each slice*. Both properties at once
-                // rather than one traded for the other.
-                //
-                // Slice `i` is `[i*want/take, (i+1)*want/take)`, which is
-                // `spawn_pick`'s mapping read as a range. `take <= want` makes
-                // every slice non-empty, and slice starts are `>= i`, so
-                // swapping each winner down to position `i` never disturbs a
-                // slice not yet visited.
-                // How many strata to cut the block into. One winner per
-                // output slot was the first attempt and it over-constrained
-                // the choice: at 32k voices a slice held ~7 candidates, so
-                // ranking could only pick best-of-7 and recovered barely a
-                // fifth of the quality that global ranking bought. Wider
-                // strata with a proportional quota each restore the
-                // selectivity while still bounding how far the admitted set
-                // can drift in time. At 64 strata a 4096-frame block is cut
-                // into 64-frame pieces -- 1.3 ms, far too short to hear as
-                // clustering -- and each picks its own top share.
-                let strata = take.min(ADMIT_STRATA);
-                for s in 0..strata {
-                    let lo = (s as u64 * want as u64 / strata as u64) as usize;
-                    let hi = ((s + 1) as u64 * want as u64 / strata as u64) as usize;
-                    let olo = (s as u64 * take as u64 / strata as u64) as usize;
-                    let ohi = ((s + 1) as u64 * take as u64 / strata as u64) as usize;
-                    let q = ohi - olo;
-                    if q == 0 {
-                        continue;
-                    }
-                    let key = |c: &SpawnCmd| {
-                        std::cmp::Reverse(crate::voice::admit_key(
-                            c,
-                            !gates.released(c.gate_slot, c.ordinal),
-                        ))
-                    };
-                    let seg = &mut self.spawn_buf[lo..hi];
-                    let n = seg.len();
-                    if q < n {
-                        seg.select_nth_unstable_by_key(q, key);
-                    }
-                    // Sorted, not left in partition order: the order decides
-                    // which voice lands in which pool slot, and therefore the
-                    // summation order of the mixdown.
-                    seg[..q.min(n)].sort_unstable_by_key(key);
-                    // Slide the winners down. `olo <= lo` because
-                    // `take <= want`, so this never reaches into a stratum
-                    // still to be visited.
-                    for j in 0..q {
-                        self.spawn_buf.swap(olo + j, lo + j);
+        // Admission, on candidates rather than on built voices.
+        //
+        // `take` is what the backend would have kept anyway; deciding it here
+        // means the block builds that many voices instead of building every
+        // note-on and throwing most of them away. On a block of 98.5M note-ons
+        // against a 1M pool that is the difference between 15 GiB of host
+        // memory and a few hundred megabytes.
+        self.resolve_sustained();
+        let live = backend.stats().active_voices as u32;
+        let want = self.cands.len();
+        let take = self.cfg.admit_take(live, want as u32) as usize;
+        self.stats.dropped += (want - take) as u64;
+
+        if take < want && take > 0 {
+            match self.cfg.admit_rule {
+                // Thinned across the block rather than truncated, so a
+                // saturated block keeps its timing instead of being heard at
+                // its start and silent at its end. `spawn_pick(i, ..) >= i`, so
+                // compacting forwards in place never overwrites a candidate
+                // still to be read.
+                AdmitRule::Even => {
+                    for i in 0..take {
+                        self.cands[i] = self.cands[crate::voice::spawn_pick(i, want, take)];
                     }
                 }
+                AdmitRule::Loudest => self.rank_candidates(want, take),
             }
         }
+        self.materialise(take);
+
         backend.spawn(&self.spawn_buf)?;
-        self.stats.voices_spawned += self.spawn_buf.len() as u64;
+        // `want`, not what was admitted. The counter has always meant "voices
+        // this block queued", dropped ones included, and changing that
+        // silently would move a number people read off the summary line.
+        self.stats.voices_spawned += want as u64;
         backend.render(out)?;
 
         if self.cfg.limiter {
@@ -561,77 +622,240 @@ impl Driver {
         Ok(more)
     }
 
-    /// Queue one voice for this block, pinning the copy of the params table it
-    /// was born under. A voice carries its variant rather than reading it from
-    /// the tile row, so that reference has to be honoured by `set_sound_cc`
-    /// the same way a row's is -- a delayed voice can even be carrying one
-    /// from an earlier block.
-    fn queue_spawn(&mut self, cmd: SpawnCmd) {
-        if cmd.variant != 0 {
-            self.variant_used |= 1u64 << cmd.variant;
-            self.spawn_variants = true;
+    /// Assemble the device-side command for one built layer.
+    #[allow(clippy::too_many_arguments)]
+    fn make_cmd(
+        v: &VoiceSpawn,
+        variant: u32,
+        gate_slot: u32,
+        ordinal: u32,
+        start_rel: u32,
+        id: u64,
+    ) -> SpawnCmd {
+        SpawnCmd {
+            phase_lo: v.phase.lo(),
+            phase_hi: v.phase.hi(),
+            step_lo: v.step.lo(),
+            step_hi: v.step.hi(),
+            smp_base: v.smp_base,
+            smp_len: v.smp_len,
+            loop_start: v.loop_start,
+            loop_end: v.loop_end,
+            flags: v.flags,
+            params: v.params,
+            // Events are handled in stream order, so this is the variant in
+            // force at the note-on's own frame -- which the tile row does not
+            // yet carry if the controller arrived on this very tick.
+            variant,
+            region: v.region,
+            gate_slot,
+            ordinal,
+            start_rel,
+            note_id_lo: id as u32,
+            note_id_hi: (id >> 32) as u32,
+            gain_l: v.gain_l,
+            gain_r: v.gain_r,
         }
-        self.spawn_buf.push(cmd);
+    }
+
+    /// Move the `take` best candidates to the front, ranked *within* time
+    /// strata rather than across the whole block.
+    ///
+    /// Ranking globally was the first attempt and it reintroduced exactly the
+    /// artifact `spawn_pick` exists to prevent. The top `take` by amplitude has
+    /// no reason to be spread across the block, and loud notes cluster in time
+    /// -- chords, downbeats -- so the admitted set piled up at the block's
+    /// opening and left its tail thin. Measured on The Nuker 3, which drops 48%
+    /// of its voices, that was +6.3 dB at the start of the block against the
+    /// block mean, audible as pumping at the block rate.
+    ///
+    /// The strata decide *when*, exactly as `spawn_pick` would; the key decides
+    /// *which candidate within each stratum*. Both properties at once rather
+    /// than one traded for the other.
+    ///
+    /// Stratum `s` is `[s*want/strata, (s+1)*want/strata)` with a proportional
+    /// quota each. One winner per output slot was the first attempt and it
+    /// over-constrained the choice: at 32k voices a slice held ~7 candidates,
+    /// so ranking could only pick best-of-7. At 64 strata a 4096-frame block is
+    /// cut into 64-frame pieces -- 1.3 ms, far too short to hear as clustering
+    /// -- and each picks its own top share.
+    fn rank_candidates(&mut self, want: usize, take: usize) {
+        let cands = &mut self.cands;
+        let strata = take.min(ADMIT_STRATA);
+        for s in 0..strata {
+            let lo = (s as u64 * want as u64 / strata as u64) as usize;
+            let hi = ((s + 1) as u64 * want as u64 / strata as u64) as usize;
+            let olo = (s as u64 * take as u64 / strata as u64) as usize;
+            let ohi = ((s + 1) as u64 * take as u64 / strata as u64) as usize;
+            let q = ohi - olo;
+            if q == 0 {
+                continue;
+            }
+            // The sustained bit is already folded into `key`, so ranking is
+            // a plain sort over one word. Resolving it inside the comparator
+            // instead cost three random lookups and a gate-table probe per
+            // *comparison*, which measured as 20% of a full Hypernova render.
+            let key = |c: &Cand| std::cmp::Reverse(c.key);
+            let seg = &mut cands[lo..hi];
+            let n = seg.len();
+            if q < n {
+                seg.select_nth_unstable_by_key(q, key);
+            }
+            // Sorted, not left in partition order: the order decides which
+            // voice lands in which pool slot, and therefore the summation
+            // order of the mixdown.
+            seg[..q.min(n)].sort_unstable_by_key(key);
+            // Slide the winners down. `olo <= lo` because `take <= want`, so
+            // this never reaches into a stratum still to be visited.
+            for j in 0..q {
+                cands.swap(olo + j, lo + j);
+            }
+        }
+    }
+
+    /// Fold each candidate's sustained bit into its key, once, before ranking.
+    ///
+    /// `admit_key`'s top bit is whether the note is still sounding at the end
+    /// of the block, which is not known until the block's last event is in. It
+    /// is bit 63, so it ORs in without disturbing the gain or the id beneath.
+    fn resolve_sustained(&mut self) {
+        let mut cands = std::mem::take(&mut self.cands);
+        for c in &mut cands {
+            let (slot, ordinal) = if c.note == DEFERRED {
+                let cmd = &self.deferred_now[c.region as usize];
+                (cmd.gate_slot, cmd.ordinal)
+            } else {
+                let (ch, key, _, _, _) = note_unpack(self.notes[c.note as usize]);
+                (
+                    GateTable::slot(ch, key) as u32,
+                    self.note_ordinal[c.note as usize],
+                )
+            };
+            if !self.gates.released(slot, ordinal) {
+                c.key |= 1u64 << 63;
+            }
+        }
+        self.cands = cands;
+    }
+
+    /// Build the voices for the first `take` candidates, appending them to
+    /// `spawn_buf` in candidate order.
+    ///
+    /// This is the point of the whole exercise: `build_layer` runs here and
+    /// nowhere else, so a block that queued a hundred million note-ons and can
+    /// admit a million builds a million voices rather than a hundred million.
+    fn materialise(&mut self, take: usize) {
+        let cands = std::mem::take(&mut self.cands);
+        for c in &cands[..take.min(cands.len())] {
+            if c.note == DEFERRED {
+                self.spawn_buf.push(self.deferred_now[c.region as usize]);
+                continue;
+            }
+            let (ch, key, vel, variant, rel) = note_unpack(self.notes[c.note as usize]);
+            let ordinal = self.note_ordinal[c.note as usize];
+            let Some(v) = self.bank.build_layer(c.region, key, vel, &self.cfg) else {
+                // The preview said this layer exists, so this is unreachable
+                // unless the two have drifted apart.
+                debug_assert!(false, "preview named a layer build_layer will not build");
+                continue;
+            };
+            // A delayed layer whose start still lands inside this block is a
+            // candidate like any other, but it starts late.
+            let start_rel = if v.delay_frames == 0 {
+                rel
+            } else {
+                rel + v.delay_frames
+            };
+            self.spawn_buf.push(Self::make_cmd(
+                &v,
+                variant,
+                GateTable::slot(ch, key) as u32,
+                ordinal,
+                start_rel,
+                self.block_first_id + c.id_off as u64,
+            ));
+        }
+        self.cands = cands;
     }
 
     fn handle_event(&mut self, ev: Event, rel: u32, block_start: u64) {
         match ev {
             Event::NoteOn { ch, key, vel } => {
                 let ordinal = self.gates.note_on(ch, key, rel);
-                let slot = GateTable::slot(ch, key) as u32;
-                self.voice_buf.clear();
-                self.bank.note_on(
+                self.stats.notes += 1;
+                let variant = self.cur_variant[ch as usize & 15];
+
+                // Preview rather than build. A saturated block cannot admit
+                // most of these, and building a voice for one that is about to
+                // be dropped is the whole cost this exists to remove.
+                let mut prev = std::mem::take(&mut self.preview_buf);
+                prev.clear();
+                self.bank.preview_note_on(
                     self.preset[ch as usize & 15],
                     key,
                     vel,
-                    &self.cfg,
                     self.cfg.max_layers as usize,
-                    &mut self.voice_buf,
+                    &mut prev,
                 );
-                self.stats.notes += 1;
-                for v in std::mem::take(&mut self.voice_buf) {
+
+                let note = self.notes.len() as u32;
+                let mut recorded = false;
+                for p in prev.iter() {
+                    // Ids are handed out here, in candidate order, exactly as
+                    // they were when this loop built voices -- so a candidate's
+                    // id is `block_first_id` plus its index and never has to be
+                    // stored. A delayed layer takes one too, because it did
+                    // before and the sequence has to be the same either way.
                     let id = self.next_note_id;
                     self.next_note_id += 1;
-                    let cmd = SpawnCmd {
-                        phase_lo: v.phase.lo(),
-                        phase_hi: v.phase.hi(),
-                        step_lo: v.step.lo(),
-                        step_hi: v.step.hi(),
-                        smp_base: v.smp_base,
-                        smp_len: v.smp_len,
-                        loop_start: v.loop_start,
-                        loop_end: v.loop_end,
-                        flags: v.flags,
-                        params: v.params,
-                        // Events are handled in stream order, so this is the
-                        // variant in force at the note-on's own frame -- which
-                        // the tile row does not yet carry if the controller
-                        // arrived on this very tick.
-                        variant: self.cur_variant[ch as usize & 15],
-                        region: v.region,
-                        gate_slot: slot,
-                        ordinal,
-                        start_rel: rel,
-                        note_id_lo: id as u32,
-                        note_id_hi: (id >> 32) as u32,
-                        gain_l: v.gain_l,
-                        gain_r: v.gain_r,
-                    };
-                    if v.delay_frames == 0 {
-                        self.queue_spawn(cmd);
-                    } else {
-                        let start = block_start + rel as u64 + v.delay_frames as u64;
-                        if start < block_start + self.cfg.block_frames as u64 {
-                            let mut c = cmd;
-                            c.start_rel = (start - block_start) as u32;
-                            self.queue_spawn(c);
-                        } else {
-                            self.deferred.push((start, cmd));
+
+                    if p.delay_frames != 0 {
+                        let start = block_start + rel as u64 + p.delay_frames as u64;
+                        if start >= block_start + self.cfg.block_frames as u64 {
+                            // Lands in a later block, so it is not this block's
+                            // to admit. Build it now and park it; delayed voices
+                            // are rare enough that this is not the hot path.
+                            if let Some(v) =
+                                self.bank.build_layer(p.region, key, vel, &self.cfg)
+                            {
+                                let cmd = Self::make_cmd(
+                                    &v,
+                                    variant,
+                                    GateTable::slot(ch, key) as u32,
+                                    ordinal,
+                                    rel,
+                                    id,
+                                );
+                                self.deferred.push((start, cmd));
+                            }
+                            continue;
                         }
                     }
+
+                    if !recorded {
+                        self.notes.push(note_pack(ch, key, vel, variant, rel));
+                        self.note_ordinal.push(ordinal);
+                        recorded = true;
+                    }
+                    let id_off = id - self.block_first_id;
+                    debug_assert!(id_off <= u32::MAX as u64);
+                    self.cands.push(Cand {
+                        key: rank_key(p.gain_l, p.gain_r, id),
+                        note,
+                        region: p.region,
+                        id_off: id_off as u32,
+                    });
+
+                    // A variant a queued voice was born under has to stay
+                    // reachable for the whole block whether or not the voice
+                    // survives admission, which is what the old code did by
+                    // pinning at queue time.
+                    if variant != 0 {
+                        self.variant_used |= 1u64 << variant;
+                        self.spawn_variants = true;
+                    }
                 }
-                // Put the buffer back so its allocation is reused.
-                self.voice_buf = Vec::new();
+                self.preview_buf = prev;
             }
             Event::NoteOff { ch, key } => {
                 self.gates.note_off(ch, key, rel);

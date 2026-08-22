@@ -490,6 +490,9 @@ pub fn load(path: impl AsRef<Path>, cfg: &Config) -> Result<Bank> {
         samples,
         regions,
         params: Vec::new(),
+        gain_table: Vec::new(),
+        delay_frames: Vec::new(),
+        key_ok: Vec::new(),
         presets,
         index: Vec::new(),
         name: path

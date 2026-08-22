@@ -387,6 +387,40 @@ pub struct Bank {
     /// Sorted (bank, program) -> preset index.
     pub(crate) index: Vec<((u16, u16), u32)>,
     pub name: String,
+
+    // ---- admission preview tables, built by `finish` --------------------
+    //
+    // Admission has to rank a note-on before anything is built for it, and
+    // `admit_key` ranks on the voice's opening gain. That gain depends only on
+    // `(region, velocity)`, and whether a layer exists at all depends only on
+    // `(region, key)`, so both are precomputed here and the ranking pass reads
+    // them instead of calling `build_voice`. See `preview_note_on`.
+    /// `region * 128 + vel` -> the `(gain_l, gain_r)` `build_voice` would
+    /// produce. Bit-exact, not an approximation: the arithmetic below is the
+    /// same sequence of f32 operations on the same inputs.
+    pub(crate) gain_table: Vec<[f32; 2]>,
+    /// `build_voice`'s `delay_frames` per region. A region constant, and the
+    /// preview needs it to route delayed voices away from admission.
+    pub(crate) delay_frames: Vec<u32>,
+    /// Bitset over `region * 128 + key`, set when `build_voice` would return
+    /// `Some` for that pair. Everything that can make it return `None` --
+    /// a missing or empty sample, a pitch ratio that is not finite and
+    /// positive -- is a function of the region and the key alone.
+    pub(crate) key_ok: Vec<u64>,
+}
+
+/// One layer a note-on would produce, as far as admission needs to know it.
+/// Produced by `preview_note_on`, which costs two table lookups per layer
+/// against `build_voice`'s pitch math and address arithmetic.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreviewLayer {
+    pub region: u32,
+    pub gain_l: f32,
+    pub gain_r: f32,
+    /// `VoiceSpawn::delay_frames`. Admission never sees a delayed voice -- it
+    /// goes on the deferred queue and is ranked in the block it lands in -- so
+    /// the preview has to answer this before ranking, not after.
+    pub delay_frames: u32,
 }
 
 /// Everything the device needs to start one voice. Produced by `note_on`.
@@ -506,6 +540,22 @@ impl Bank {
         }
     }
 
+    /// Build the one layer `preview_note_on` named, by its region index.
+    ///
+    /// The preview has already decided this layer exists, so this is the other
+    /// half of the split: admission ranks on the preview, and only the notes it
+    /// admits ever reach here.
+    pub fn build_layer(
+        &self,
+        region: u32,
+        key: u8,
+        vel: u8,
+        cfg: &Config,
+    ) -> Option<VoiceSpawn> {
+        let r = self.regions.get(region as usize)?;
+        self.build_voice(r, region, key.min(127), vel, cfg)
+    }
+
     fn build_voice(
         &self,
         r: &Region,
@@ -622,6 +672,123 @@ impl Bank {
             n += vel_span * if per_key { 128 } else { 1 };
         }
         self.params = self.build_variant(cfg, &ParamMod::default());
+        self.build_admission_tables(cfg);
+    }
+
+    /// Precompute what admission needs to rank a note-on without building it.
+    ///
+    /// The whole point of culling is that a block may contain a hundred times
+    /// more note-ons than the pool can take, so ranking them must not cost a
+    /// `build_voice` each. Both tables are exact rather than approximate --
+    /// `preview_note_on` returns the same layers with the same gains that
+    /// `note_on` would -- which is what lets admission move earlier without
+    /// changing which notes are admitted.
+    fn build_admission_tables(&mut self, cfg: &Config) {
+        let n = self.regions.len();
+        self.gain_table = vec![[0.0, 0.0]; n * 128];
+        self.key_ok = vec![0u64; (n * 128).div_ceil(64)];
+        self.delay_frames = self
+            .regions
+            .iter()
+            .map(|r| (r.delay * cfg.sample_rate as f32) as u32)
+            .collect();
+
+        for (ri, r) in self.regions.iter().enumerate() {
+            // Gain: the same arithmetic as `build_voice`, in the same order, so
+            // the f32 results are bit-identical rather than merely close.
+            let theta = (r.pan.clamp(-1.0, 1.0) + 1.0) * 0.5 * (PI as f32 * 0.5);
+            let (pan_l, pan_r) = (theta.cos(), theta.sin());
+            for v in 0..128u8 {
+                let eff_vel = if r.fixed_vel >= 0 { r.fixed_vel as u8 } else { v };
+                let atten = r.attenuation_cb + velocity_atten_cb(eff_vel);
+                let gain = cb_to_gain(atten) * cfg.master_volume;
+                self.gain_table[ri * 128 + v as usize] = [gain * pan_l, gain * pan_r];
+            }
+
+            // Existence: `build_voice` gives up on a missing or empty sample and
+            // on a pitch ratio that is not finite and positive. The sample is
+            // fixed per region and the ratio depends on the key but never on
+            // the velocity, so one bit per (region, key) covers every case.
+            let Some(s) = self.samples.get(r.sample as usize) else {
+                continue;
+            };
+            if s.len == 0 {
+                continue;
+            }
+            for k in 0..128u8 {
+                let eff_key = if r.fixed_key >= 0 { r.fixed_key as u8 } else { k };
+                let root = if r.root_key_override >= 0 {
+                    r.root_key_override as f64
+                } else {
+                    s.root_key as f64
+                };
+                let cents = (eff_key as f64 - root) * r.scale_tuning as f64
+                    + r.coarse_tune as f64 * 100.0
+                    + r.fine_tune as f64
+                    + s.correction_cents as f64;
+                let mut ratio = (cents / 1200.0).exp2();
+                if self.pool_rate == 0 {
+                    ratio *= s.rate as f64 / cfg.sample_rate as f64;
+                } else {
+                    ratio *= self.pool_rate as f64 / cfg.sample_rate as f64;
+                }
+                if ratio.is_finite() && ratio > 0.0 {
+                    let bit = ri * 128 + k as usize;
+                    self.key_ok[bit / 64] |= 1u64 << (bit % 64);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn region_key_ok(&self, region: u32, key: u8) -> bool {
+        let bit = region as usize * 128 + key as usize;
+        self.key_ok[bit / 64] >> (bit % 64) & 1 != 0
+    }
+
+    /// The layers `note_on` would produce, and each one's opening gain, without
+    /// building any of them.
+    ///
+    /// Iterates exactly as `note_on` does -- same preset key index, same
+    /// velocity window, same `max_layers` cut -- so the `i`-th preview entry
+    /// corresponds to the `i`-th voice, which is what lets note ids be handed
+    /// out here and honoured later.
+    pub fn preview_note_on(
+        &self,
+        preset: u32,
+        key: u8,
+        vel: u8,
+        max_layers: usize,
+        out: &mut Vec<PreviewLayer>,
+    ) {
+        let Some(p) = self.presets.get(preset as usize) else {
+            return;
+        };
+        let key = key.min(127);
+        let lo = p.key_index[key as usize] as usize;
+        let hi = p.key_index[key as usize + 1] as usize;
+        let mut layers = 0usize;
+
+        for &ri in &p.key_regions[lo..hi] {
+            if layers >= max_layers {
+                break;
+            }
+            let r = &self.regions[ri as usize];
+            if vel < r.vel_lo || vel > r.vel_hi {
+                continue;
+            }
+            if !self.region_key_ok(ri, key) {
+                continue;
+            }
+            let g = self.gain_table[ri as usize * 128 + vel as usize];
+            out.push(PreviewLayer {
+                region: ri,
+                gain_l: g[0],
+                gain_r: g[1],
+                delay_frames: self.delay_frames[ri as usize],
+            });
+            layers += 1;
+        }
     }
 
     /// Build one copy of the params table with a channel's sound controllers

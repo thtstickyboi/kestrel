@@ -328,7 +328,9 @@ fn render(args: RenderArgs) -> Result<()> {
         driver.stats.voices_spawned,
         peak_voices,
         st.stolen,
-        st.dropped,
+        // From the driver: admission happens before a voice is built, so the
+        // backend never sees a refused note-on to count.
+        driver.stats.dropped,
         driver.stats.peak
     );
     if driver.stats.clipped > 0 {

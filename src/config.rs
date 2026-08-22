@@ -501,6 +501,15 @@ impl Config {
                 self.max_steal_percent
             );
         }
+        // 255 and 65535 are the widths the driver packs a note-on into while
+        // it waits for admission. Well past anything musical, but a silent
+        // truncation there would corrupt which voice a candidate refers to.
+        if self.max_layers > 255 {
+            bail!("max_layers {} must be at most 255", self.max_layers);
+        }
+        if self.block_frames > 65535 {
+            bail!("block_frames {} must be at most 65535", self.block_frames);
+        }
         if self.max_layers == 0 {
             bail!("max_layers must be non-zero");
         }

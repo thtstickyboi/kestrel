@@ -135,6 +135,16 @@ Three things allocate:
 - **The sample pool**, which is your entire soundfont resampled to one rate. A
   large multi-sampled piano runs to hundreds of megabytes.
 
+**Host RAM is a separate constraint, and on very large files it is the binding
+one.** A block is admitted as a whole, so every note-on inside it is held in
+memory until the block ends. That scales with `--block`: a 6.6 GB, 824M-note
+file has one 512-frame block carrying 94 million note-ons, which costs about
+4.8 GiB at `--block 512` and roughly eight times that at the 4096 default. If a
+render dies with a failed allocation rather than a GPU error, lower `--block`
+-- 512, 256 and 128 are all valid, 128 being the floor. Lowering `--max-voices`
+does *not* help, because the block is considered in full before admission thins
+it. `ADMISSION.md` has the measurements.
+
 If the sample pool will not fit within `--pool-budget` (2 GB by default),
 Kestrel halves its sample rate until it does rather than failing, on the
 grounds that a downsampled render beats no render. Lower that budget on a
@@ -190,6 +200,7 @@ kestrel render huge.mid -s piano.sfz -o out.wav --limiter brickwall --profile
 | Flag | Default | What it does |
 |---|---|---|
 | `--backend` | `gpu` | `cpu` is the reference implementation: correct, slow, single-threaded. |
+| `--block N` | `4096` | Frames per render block. Also sets how many note-ons are held in host RAM at once; lower it if a huge file exhausts memory. |
 | `--max-voices N` | `1048576` | Ceiling on simultaneous voices. The single biggest lever on both VRAM and speed. The maximum is whatever your card will bind; it is 17,895,696 on an RTX 5060 at the default `--steal-percent`, and the error names yours. |
 | `--interp` | `linear` | `nearest`, `linear` or `cubic`. Cubic costs roughly double the bandwidth. |
 | `--seconds N` | off | Stop after N seconds of output. Use this constantly while experimenting. |
