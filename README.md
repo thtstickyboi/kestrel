@@ -205,6 +205,7 @@ kestrel render huge.mid -s piano.sfz -o out.wav --limiter brickwall --profile
 | `--interp` | `linear` | `nearest`, `linear` or `cubic`. Cubic costs roughly double the bandwidth. |
 | `--seconds N` | off | Stop after N seconds of output. Use this constantly while experimenting. |
 | `--profile` | off | Per-pass GPU timings, once per wall-clock second. |
+| `--block-csv` | off | One CSV row per block: voices alive at the admission decision, layers queued and admitted, voices stolen and dropped, output RMS and peak. The audio is downstream of these numbers, so read them rather than the waveform when level moves at the block rate. |
 | `--limiter` | `brickwall` | `brickwall`, `omni` or `off`. See *Limiting*. |
 | `--steal` | `quietest` | `quietest`, `oldest` or `drop-new`. See *Voice stealing*. |
 | `--admit` | `loudest` | `loudest` or `even`. Which note-ons survive when a block oversubscribes the pool. See *Admission*. |
@@ -345,19 +346,59 @@ at the block rate on material dropping around half its voices. A stratum is
 1.3 ms, far too short to cluster audibly, and wide enough that ranking inside
 it is still a real choice.
 
-The rank itself is a 64-bit key: whether the note is still sounding at the end
-of the block, then its opening amplitude, then its note id as a tiebreak. The
-amplitude term is the voice's real opening gain -- it already carries the
-velocity, the region's own attenuation and its pan -- rather than a raw
-velocity byte. The id makes the key a total order with no ties, so the admitted
-set is a pure function of the input.
+The rank itself is a 64-bit key: the note's opening amplitude on a logarithmic
+scale, then a scrambled candidate index as a tiebreak. The amplitude term is
+the voice's real opening gain -- it already carries the velocity, the region's
+own attenuation and its pan -- rather than a raw velocity byte. The scramble
+makes the key a total order with no ties, so the admitted set is a pure
+function of the input.
+
+Both halves of that sentence were wrong before 0.2.4, and between them they
+were the largest source of block-rate pumping in the renderer.
+
+The amplitude term used to be `(gain_l + gain_r)` clamped to 1.0 and quantised.
+A loud soundfont at unity volume puts nearly every voice above 1.0, so the
+field **saturated**: on a loud sampled piano the queued mean measured 32,470
+of a possible 32,767 and the admitted mean 32,767.00 exactly.
+Carrying no information, it left the tiebreak deciding almost every
+comparison. It is now taken from the float's own bit pattern, which is
+monotonic in the value and whose exponent field is literally log2 -- a
+logarithmic rank for one shift, with nothing to saturate against.
+
+The tiebreak used to be the raw note id. Ids are handed out in time order, so
+every tie resolved toward the later note -- a rank that is a function of *when
+a note arrives*, applied inside time strata whose entire purpose is to keep
+rank and time independent.
+
+And there used to be a third field, ranked above both: whether the note was
+still sounding at the end of *this block*. That is a fact about where in the
+block a note falls rather than about the note, and for the tick-length notes
+black MIDI is made of it is very nearly a function of position alone. Its
+justification was that a note whose note-off has already arrived is cheap to
+drop because nothing is lost past the block boundary, which holds only if
+release is instant. A sampled piano releases over seconds, so the release tail
+*is* the voice. It was removed.
+
+Measured as amplitude modulation at the block rate over the worst six seconds
+of a saturated section, limiter off:
+
+| | AM depth | peak-to-trough |
+|---|---|---|
+| before | 26.31% | 4.68 dB |
+| tiebreak and amplitude fixed | 16.49% | 2.89 dB |
+| **and the block-relative field removed** | **1.23%** | **0.21 dB** |
+| `--admit even`, which ranks by nothing | 1.33% | 0.23 dB |
+
+1.23% against a 1.33% floor means there is no block-rate component left for
+admission to remove. The within-block level profile spans 0.66 dB where it
+spanned 5.71 dB before.
 
 **`even`** thins the block by position in time and ignores what each note is,
 which is what the renderer did before ranking existed. It is blind in a
 specific way: a fortissimo whole note and a 10 ms grace note have identical
 odds of survival.
 
-Measured on the same file and pool, `loudest` against `even`:
+Measured at `--max-voices 32767`, `loudest` against `even`:
 
 | | `even` | `loudest` |
 |---|---|---|
@@ -366,14 +407,21 @@ Measured on the same file and pool, `loudest` against `even`:
 | samples above 0.01 | 88.7% | **93.7%** |
 
 A higher RMS at an identical peak, with a lower crest factor, is what "the long
-loud notes survived" looks like as a number. Ranking costs about 5% of render
-time.
+loud notes survived" looks like as a number.
 
-One limit worth knowing: "still sounding at the end of the block" is resolved
-at block granularity, not by true duration. A note that ends 5 ms into the next
-block counts as sustained. It works because genuinely short notes almost always
-end inside their own block, but it is an approximation rather than a
-measurement.
+Those figures date from 0.2.2 and a smaller pool, and the gap narrows sharply
+as the pool grows: at the default 1,048,576 voices the two rules now render
+within 0.01 dB RMS of each other. The difference `loudest` buys is
+largest exactly where the pool is smallest relative to the material, which is
+also where it matters most.
+
+One limit worth knowing: **there is no duration term at all.** The
+block-relative field removed above was the only thing standing in for "this
+note will actually sound for a while", crude as it was. Ranking is now purely
+by opening amplitude, so a loud note cut short and a loud note held both look
+the same to it. Expressing duration properly needs one block of lookahead --
+free for offline rendering, and unlike the field it replaces it would be a
+property of the note rather than of the block.
 
 ## Voice stealing
 
@@ -470,16 +518,98 @@ each voice compares its own ordinal against it.
   use a preset that does not use `lorand` (most packs ship one), or cap
   `--layers`.
 - **SFZ support is otherwise partial.** The common opcodes work, including
-  `#include`, velocity layers and `fil_veltrack`. Per-voice LFOs (`amplfo_*`,
+  `#include`, velocity layers, `fil_veltrack`, `amp_veltrack`, `key`,
+  `loopstart`/`loopend`, `pitch_keytrack` and `off_by` where it names its own
+  group. Several of those arrived in 0.2.4 -- see the release notes below,
+  because two of them were loading libraries wrongly rather than merely
+  ignoring them. Per-voice LFOs (`amplfo_*`,
   `fillfo_*`, `pitchlfo_*`) are recognised and reported, not applied -- though
   note that an LFO with a rate and no `*_depth` opcode would do nothing anyway,
   which is the common case in piano libraries.
 - **NaN checking is off in release builds** unless you pass `--nan-guard`.
 
+## What changed in 0.2.4
+
+**Renders are not bit-compatible with 0.2.3.** Admission picks different notes
+now, so every output differs. Two runs of the same file on the same build are
+still byte-identical -- that guarantee is unchanged and is checked on real
+material, not just synthetics.
+
+### Block-rate pumping in saturated sections is fixed
+
+Three defects in the admission key, described in full under *Admission* above.
+The short version: its amplitude field saturated and carried no information,
+its tiebreak resolved every tie toward later notes, and its top-ranked field
+was a fact about where in the block a note fell rather than about the note.
+Together they tilted the level inside every block.
+
+Over the worst six seconds of a saturated section, amplitude modulation at the
+block rate went from **26.31% to 1.23%** -- level with the 1.33% that
+`--admit even` reaches by not ranking at all, which is the floor. The
+within-block level profile went from 5.71 dB to 0.66 dB.
+
+Checked across six large files at stock defaults, from 45 million to 2.7
+billion notes. Worst case in that set is 0.73 dB peak-to-trough.
+
+### Seven SFZ loading defects
+
+Two of these were loading libraries **wrongly**, not merely ignoring an opcode:
+
+- A region's `key` lost to a group's `lokey`/`hikey`. Any library that sets a
+  key range on a `<group>` and then `#include`s a per-key region list written
+  as `key=N` -- a very common layout -- had **every region span the whole
+  keyboard**. Every note then played `--layers` worth of the wrong samples,
+  pitch-shifted. One affected library loaded with 7,052 of its 7,216 regions
+  spanning 0..127, and middle C played samples belonging to keys 22 to 29.
+- Multiple `<control> default_path` directives: the last one governed the whole
+  file rather than the regions following it, so a library split into sections
+  by sample folder loaded entirely from the last folder. Silently -- the wrong
+  file exists, so nothing warned.
+
+And five more: `<master>` accumulated into `<global>` instead of replacing it;
+`loopstart`/`loopend` were dropped; `amp_veltrack` was ignored, so velocity
+always scaled amplitude and a library that splits by velocity had it applied
+twice; `loop_start`/`loop_end`/`end` mixed source and pool frames when the pool
+was resampled; and `KNOWN_OPCODES` was wrong in both directions -- warning
+about `pitch_keytrack`, which is honoured, and silently accepting `off_by`,
+which was not read at all.
+
+`group` on its own no longer mutes. In SFZ `group` only labels and `off_by` is
+what mutes, so `group=1` with no `off_by` was cutting notes the library meant
+to keep.
+
+### A padded MIDI file no longer looks like a hang
+
+`MidiStream::open` treated anything with a readable 8-byte header as a chunk,
+so trailing zeros parsed as zero-length chunks and the walk stepped eight bytes
+at a time to the end of the file. On a 6 GB file with 1.4 GB of padding after
+its last track that is 172 million seek-and-read pairs -- minutes of no output,
+disk idle, one core busy. The walk now stops at the first unrecognised tag with
+no body and warns with the number of bytes it ignored.
+
+### `--block-csv`
+
+One row per block: voices alive at the admission decision, layers queued and
+admitted, voices stolen and dropped, output RMS and peak. This is the
+diagnostic for anything that moves at the block rate -- the audio is downstream
+of those numbers, and reading them settles in seconds what a render takes
+minutes to guess at.
+
+### Speed
+
+Unchanged. The winning prefix of each stratum was being sorted after being
+selected, which is 262k elements per block for nothing: `select_nth_unstable`
+is already deterministic, and deterministic order is all the mixdown needs.
+Removing it paid for the new ranking exactly. Matched three-run samples on a
+131 s render: 88.5 s before, 88.1 s after.
+
+
 ## Planned for the next release
 
 **`lorand`/`hirand` support** is the priority and is the next thing being
-worked on. It is one of the cheaper missing opcodes to add and it does not threaten
+worked on. It was the priority for 0.2.4 as well and did not make it -- the
+release went on block-rate pumping and SFZ loading instead, both of which
+turned out to be producing wrong output rather than merely missing a feature. It is one of the cheaper missing opcodes to add and it does not threaten
 the determinism guarantee: the roll becomes a hash of the note id, so it varies
 from note to note while two renders of the same file stay byte-identical.
 
