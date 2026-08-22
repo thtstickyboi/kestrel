@@ -93,9 +93,15 @@ pub enum StealRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AdmitRule {
-    /// Rank by `voice::admit_key`: notes that outlive the block first, then by
-    /// opening amplitude, with the note id as a tiebreak. Keeps the loud
-    /// sustained material and spends the budget on notes that are audible.
+    /// Rank by `voice::admit_key`: opening amplitude on a logarithmic scale,
+    /// with a scrambled candidate index as a tiebreak. Spends the budget on
+    /// the notes that are audible rather than on whichever ones happened to
+    /// arrive.
+    ///
+    /// It used to rank notes that outlive the block above everything else.
+    /// That field was removed on 2026-08-22 -- it was a fact about block
+    /// position rather than about the note, and it was the largest source of
+    /// block-rate pumping in the renderer. See `voice::admit_key`.
     Loudest = 0,
     /// Thin the block evenly by event position, ignoring what each note is.
     /// The behaviour before ranking existed; kept for comparing against it.

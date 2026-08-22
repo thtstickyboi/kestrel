@@ -175,6 +175,12 @@ struct RenderArgs {
     /// Check every block for NaN and Inf even in release builds.
     #[arg(long = "nan-guard")]
     nan_guard: bool,
+
+    /// Write one CSV row per block: the admission decision and the level it
+    /// produced. This is the diagnostic for block-rate pumping -- the audio is
+    /// downstream of these numbers, so read them rather than the waveform.
+    #[arg(long = "block-csv", value_name = "PATH")]
+    block_csv: Option<PathBuf>,
     /// Compile shaders without automatic bounds clamps. Faster, and unsafe if
     /// anything upstream miscounts.
     #[arg(long = "unchecked-shaders")]
@@ -292,12 +298,45 @@ fn render(args: RenderArgs) -> Result<()> {
     let mut last_report = Instant::now();
     let mut peak_voices = 0u64;
 
+    let mut csv = match &args.block_csv {
+        Some(p) => {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
+            use std::io::Write;
+            writeln!(f, "block,t,live,want,take,stolen,dropped,rms,peak,want_e,take_e")?;
+            Some(f)
+        }
+        None => None,
+    };
+
     loop {
         let more = driver.next_block(backend.as_mut(), &mut block)?;
         out.write_block(&block)?;
 
         let st = backend.stats();
         peak_voices = peak_voices.max(st.active_voices);
+
+        if let Some(f) = csv.as_mut() {
+            use std::io::Write;
+            let n = block.len().max(1) as f64;
+            let ss: f64 = block.iter().map(|v| *v as f64 * *v as f64).sum();
+            let pk = block.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let d = &driver.stats;
+            writeln!(
+                f,
+                "{},{:.6},{},{},{},{},{},{:.9},{:.9},{},{}",
+                d.blocks,
+                driver.seconds_rendered(),
+                d.last_live,
+                d.last_want,
+                d.last_take,
+                d.last_stolen,
+                d.dropped,
+                (ss / n).sqrt(),
+                pk,
+                d.last_want_energy,
+                d.last_take_energy
+            )?;
+        }
 
         if last_report.elapsed().as_secs_f64() > 1.0 {
             let secs = driver.seconds_rendered();

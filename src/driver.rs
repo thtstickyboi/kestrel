@@ -165,6 +165,21 @@ pub struct DriverStats {
     /// Samples the final clamp had to pull back to full scale. Every run of
     /// these is a squared-off waveform top, which is what a click sounds like.
     pub clipped: u64,
+
+    // ---- last block only, for the per-block diagnostic ------------------
+    /// Voices alive when this block's admission decision was taken.
+    pub last_live: u32,
+    /// Note-on layers this block queued.
+    pub last_want: u32,
+    /// Layers admission let through.
+    pub last_take: u32,
+    /// Voices the backend killed to make room for them.
+    pub last_stolen: u64,
+    /// Summed opening amplitude of every layer the block queued, and of the
+    /// subset it admitted. Level follows the second of these, so if anything
+    /// moves at the block rate it moves here first.
+    pub last_want_energy: u64,
+    pub last_take_energy: u64,
 }
 
 /// Pack a note-on into one word: everything `build_layer` and `SpawnCmd` will
@@ -197,10 +212,8 @@ fn note_unpack(w: u64) -> (u8, u8, u8, u32, u32) {
 
 /// One layer a block might admit, before anything has been built for it.
 ///
-/// `key` is `voice::admit_key` with the sustained bit still clear, because
-/// whether a note is still sounding at the end of the block is not known until
-/// the block's last event is in. It is bit 63, so it ORs in later without
-/// disturbing the gain or the id beneath it.
+/// `key` is `voice::admit_key`, which no longer has a block-relative field,
+/// so it is final as soon as the candidate is built.
 #[derive(Clone, Copy)]
 struct Cand {
     key: u64,
@@ -218,12 +231,10 @@ struct Cand {
 /// `Cand::note` for a candidate that came off the deferred queue.
 const DEFERRED: u32 = u32::MAX;
 
-/// `admit_key` without the sustained bit.
+/// `admit_key`, reached without building a `SpawnCmd` first.
 #[inline]
-fn rank_key(gain_l: f32, gain_r: f32, id: u64) -> u64 {
-    let gain = (gain_l.abs() + gain_r.abs()).clamp(0.0, 1.0);
-    let q = (gain * 32767.0) as u32 as u64;
-    (q << 48) | (id & 0x0000_FFFF_FFFF_FFFF)
+fn rank_key(gain_l: f32, gain_r: f32, index: usize) -> u64 {
+    (crate::voice::rank_gain_q(gain_l, gain_r) << 48) | crate::voice::mix48(index as u64)
 }
 
 pub struct Driver {
@@ -461,9 +472,8 @@ impl Driver {
                     self.variant_used |= 1u64 << cmd.variant;
                     self.spawn_variants = true;
                 }
-                let id = ((cmd.note_id_hi as u64) << 32) | cmd.note_id_lo as u64;
                 self.cands.push(Cand {
-                    key: rank_key(cmd.gain_l, cmd.gain_r, id),
+                    key: rank_key(cmd.gain_l, cmd.gain_r, self.cands.len()),
                     note: DEFERRED,
                     region: self.deferred_now.len() as u32,
                     id_off: 0,
@@ -544,11 +554,14 @@ impl Driver {
         // note-on and throwing most of them away. On a block of 98.5M note-ons
         // against a 1M pool that is the difference between 15 GiB of host
         // memory and a few hundred megabytes.
-        self.resolve_sustained();
         let live = backend.stats().active_voices as u32;
         let want = self.cands.len();
         let take = self.cfg.admit_take(live, want as u32) as usize;
         self.stats.dropped += (want - take) as u64;
+        let stolen_before = backend.stats().stolen;
+        self.stats.last_live = live;
+        self.stats.last_want = want as u32;
+        self.stats.last_take = take as u32;
 
         if take < want && take > 0 {
             match self.cfg.admit_rule {
@@ -565,9 +578,15 @@ impl Driver {
                 AdmitRule::Loudest => self.rank_candidates(want, take),
             }
         }
+        // After the rule has reordered, not before: measuring the first
+        // `take` in arrival order reports the same number for every rule.
+        self.stats.last_want_energy = self.cands.iter().map(|c| (c.key >> 48) & 0x7FFF).sum();
+        self.stats.last_take_energy =
+            self.cands[..take.min(self.cands.len())].iter().map(|c| (c.key >> 48) & 0x7FFF).sum();
         self.materialise(take);
 
         backend.spawn(&self.spawn_buf)?;
+        self.stats.last_stolen = backend.stats().stolen - stolen_before;
         // `want`, not what was admitted. The counter has always meant "voices
         // this block queued", dropped ones included, and changing that
         // silently would move a number people read off the summary line.
@@ -691,20 +710,29 @@ impl Driver {
             if q == 0 {
                 continue;
             }
-            // The sustained bit is already folded into `key`, so ranking is
-            // a plain sort over one word. Resolving it inside the comparator
-            // instead cost three random lookups and a gate-table probe per
-            // *comparison*, which measured as 20% of a full Hypernova render.
+            // Ranking is a plain sort over one word.
             let key = |c: &Cand| std::cmp::Reverse(c.key);
             let seg = &mut cands[lo..hi];
             let n = seg.len();
             if q < n {
                 seg.select_nth_unstable_by_key(q, key);
             }
-            // Sorted, not left in partition order: the order decides which
-            // voice lands in which pool slot, and therefore the summation
-            // order of the mixdown.
-            seg[..q.min(n)].sort_unstable_by_key(key);
+            // Left in partition order, not sorted. The order does decide which
+            // voice lands in which pool slot and therefore the summation order
+            // of the mixdown, but that only has to be *deterministic*, and
+            // `select_nth_unstable` already is: "unstable" means it does not
+            // preserve the input order of equal elements, not that it is
+            // randomised, and pdqsort has no randomness in it. Sorting the
+            // prefix on top of selecting it was about 262k elements per block
+            // for nothing -- measured at **11% of a Hypernova render**, 98.5 s
+            // against 88.5 s over matched three-run samples, which is the
+            // entire cost the scrambled tiebreak appeared to introduce.
+            //
+            // The old key made this invisible: it was `gain << 48 | ascending
+            // id` with loudness saturated, so the array arrived already sorted
+            // and both the selection and the sort hit pdqsort's pre-sorted
+            // fast path. A key that actually ranks cannot be pre-sorted, which
+            // is what exposed the redundant pass rather than caused it.
             // Slide the winners down. `olo <= lo` because `take <= want`, so
             // this never reaches into a stratum still to be visited.
             for j in 0..q {
@@ -713,30 +741,6 @@ impl Driver {
         }
     }
 
-    /// Fold each candidate's sustained bit into its key, once, before ranking.
-    ///
-    /// `admit_key`'s top bit is whether the note is still sounding at the end
-    /// of the block, which is not known until the block's last event is in. It
-    /// is bit 63, so it ORs in without disturbing the gain or the id beneath.
-    fn resolve_sustained(&mut self) {
-        let mut cands = std::mem::take(&mut self.cands);
-        for c in &mut cands {
-            let (slot, ordinal) = if c.note == DEFERRED {
-                let cmd = &self.deferred_now[c.region as usize];
-                (cmd.gate_slot, cmd.ordinal)
-            } else {
-                let (ch, key, _, _, _) = note_unpack(self.notes[c.note as usize]);
-                (
-                    GateTable::slot(ch, key) as u32,
-                    self.note_ordinal[c.note as usize],
-                )
-            };
-            if !self.gates.released(slot, ordinal) {
-                c.key |= 1u64 << 63;
-            }
-        }
-        self.cands = cands;
-    }
 
     /// Build the voices for the first `take` candidates, appending them to
     /// `spawn_buf` in candidate order.
@@ -840,7 +844,7 @@ impl Driver {
                     let id_off = id - self.block_first_id;
                     debug_assert!(id_off <= u32::MAX as u64);
                     self.cands.push(Cand {
-                        key: rank_key(p.gain_l, p.gain_r, id),
+                        key: rank_key(p.gain_l, p.gain_r, self.cands.len()),
                         note,
                         region: p.region,
                         id_off: id_off as u32,
