@@ -143,7 +143,7 @@ file has one 512-frame block carrying 94 million note-ons, which costs about
 render dies with a failed allocation rather than a GPU error, lower `--block`
 -- 512, 256 and 128 are all valid, 128 being the floor. Lowering `--max-voices`
 does *not* help, because the block is considered in full before admission thins
-it. `ADMISSION.md` has the measurements.
+it.
 
 If the sample pool will not fit within `--pool-budget` (2 GB by default),
 Kestrel halves its sample rate until it does rather than failing, on the
